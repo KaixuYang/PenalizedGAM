@@ -1,5 +1,7 @@
 import numpy as np
 from patsy import dmatrix
+from sklearn.model_selection import KFold
+
 
 class GAM:
     def __init__(self, learning_rate: float = 1, learning_rate_shrink: float = 0.8, tol: float = 1e-2,
@@ -19,33 +21,37 @@ class GAM:
         self.intercept_a = None
         self.R = None  # right matrices of QR decomposition of basis matrix, used to orthogonalization.
 
-    def basis_expansion_(self, x: np.array, df: int, degree: int):
+    @staticmethod
+    def basis_expansion_(x: np.array, df: int, degree: int):
         p = x.shape[1]
         if p > 1:
+            res = None
             for i in range(x.shape[1]):
                 transformed_x = dmatrix(
                     "bs(x[:, i], df=df, degree=degree, include_intercept=False)",
                     {"train": x[:, i]}, return_type='matrix')
-                try:
-                    res = np.concatenate([res, np.array(transformed_x)[:, 1:]], axis=1)
-                except:
+                if res is None:
                     res = np.array(transformed_x[:, 1:])
+                else:
+                    res = np.concatenate([res, np.array(transformed_x)[:, 1:]], axis=1)
         else:
             res = dmatrix(
                 "bs(x, df=df, degree=degree, include_intercept=intercept)", {"train": x}, return_type='matrix')
             res = np.array(res)[:, 1:]
         return res
 
-    def compute_group_norm_(self, x: np.array, group_size: int):
+    @staticmethod
+    def compute_group_norm_(x: np.array, group_size: int):
         num_group = len(x) / group_size
         if num_group != int(num_group):
             raise ValueError("Cannot compute group norm, the length of x is not a multiple of group_size")
         num_group = int(num_group)
         group_norm = np.zeros([num_group, 1])
         for i in range(num_group):
-            group_norm[i, 0] = np.linalg.norm(x[i*group_size: (i+1)*group_size])
+            group_norm[i, 0] = np.linalg.norm(x[i * group_size: (i + 1) * group_size])
         return group_norm
 
+    @staticmethod
     def groupsum_(self, x: np.array, group_size: int):
         """
         computes the group sum of a matrix x (sum of l2-norm of each column)
@@ -55,7 +61,8 @@ class GAM:
         group_norm = self.compute_group_norm_(x, group_size)
         return np.sum(group_norm)
 
-    def grouplassothres_(self, x: np.array, group_size: int, lam: float) -> np.array:
+    @staticmethod
+    def grouplassothres_(x: np.array, group_size: int, lam: float) -> np.array:
         """
         computes the group thresholding function
         :param x: the input parameter matrix
@@ -67,13 +74,14 @@ class GAM:
             raise ValueError("Cannot compute group norm, the length of x is not a multiple of group_size")
         num_group = int(num_group)
         for i in range(num_group):
-            norm = np.linalg.norm(x[:, (i*group_size):(i+1)*group_size])
+            norm = np.linalg.norm(x[:, (i * group_size):(i + 1) * group_size])
             if norm != 0:
-                x[:, (i*group_size):(i+1)*group_size] = np.max(
-                    [0, 1 - lam / norm]) * x[:, (i*group_size):(i+1)*group_size]
+                x[:, (i * group_size):(i + 1) * group_size] = np.max(
+                    [0, 1 - lam / norm]) * x[:, (i * group_size):(i + 1) * group_size]
         return x
 
-    def sigmoid_(self, x: np.array):
+    @staticmethod
+    def sigmoid_(x: np.array):
         return np.exp(x) / (1 + np.exp(x))
 
     def group_orthogonalize_(self, x: np.array, group_size: int):
@@ -85,8 +93,8 @@ class GAM:
         new_x = np.copy(x)
         r_matrices = []
         for i in range(num_group):
-            q, r = np.linalg.qr(x[:, i*group_size:(i+1)*group_size])
-            new_x[:, i*group_size:(i+1)*group_size] = q * np.sqrt(n)
+            q, r = np.linalg.qr(x[:, i * group_size:(i + 1) * group_size])
+            new_x[:, i * group_size:(i + 1) * group_size] = q * np.sqrt(n)
             r_matrices.append(r / np.sqrt(n))
         self.R = r_matrices
         return new_x
@@ -98,7 +106,8 @@ class GAM:
         x_shape = x.shape
         x = x.reshape(-1)
         for i in range(num_group):
-            x[i*group_size:(i+1)*group_size] = np.matmul(np.linalg.inv(self.R[i]), x[i*group_size:(i+1)*group_size])
+            x[i * group_size:(i + 1) * group_size] = np.matmul(np.linalg.inv(self.R[i]),
+                                                               x[i * group_size:(i + 1) * group_size])
         x = x.reshape(x_shape)
         return x
 
@@ -124,17 +133,19 @@ class GAM:
     def compute_loss_reg_(self, x: np.array, y: np.array, beta: np.array, intercept: np.array, lam: float):
         n = x.shape[0]
         eta = np.matmul(x, beta) + intercept
-        return np.linalg.norm(y - eta) ** 2 / n + lam * self.groupsum_(beta, self.df)
+        return np.linalg.norm(y - eta) ** 2 / n + lam * self.groupsum_(self, beta, self.df)
 
     def compute_loss_cla_(self, x: np.array, y: np.array, beta: np.array, intercept: np.array, lam: float):
         n = x.shape[0]
         eta = np.matmul(x, beta) + intercept
-        return -np.sum(y * eta - np.log(1 + np.exp(eta))) / n + lam * self.groupsum_(beta, self.df)
+        return -np.sum(y * eta - np.log(1 + np.exp(eta))) / n + lam * self.groupsum_(self, beta, self.df)
 
     def fit_(self, z: np.array, y: np.array, lam: float = 0, max_iters: int = 1000):
         z = self.group_orthogonalize_(z, self.df)
         beta = np.zeros([z.shape[1], 1]) + 0.1
         intercept = np.zeros([1, 1])
+        beta_new = np.copy(beta)
+        intercept_new = np.copy(intercept)
         print('Fitting starts, parameters initialized.')
         if self.data_class == 'regression':
             loss = self.compute_loss_reg_(z, y, beta, intercept, lam)
@@ -182,19 +193,19 @@ class GAM:
         beta = self.group_orthogonalize_inverse_(beta, self.df)
         return intercept, beta
 
-    def compute_weights_(self, beta: np.array, group_size: int):
+    @staticmethod
+    def compute_weights_(beta: np.array, group_size: int):
         num_group = len(beta) // group_size
         weights = np.zeros([num_group, 1])
         for i in range(num_group):
-            norm = np.linalg.norm(beta[i*group_size:(i+1)*group_size])
+            norm = np.linalg.norm(beta[i * group_size:(i + 1) * group_size])
             if norm <= 1e-6:
                 weights[i] = 1e6
             else:
                 weights[i] = 1 / norm
         return weights
 
-    def fit_grplasso(
-            self, x: np.array, y: np.array, lam: float, max_iters: int = 1000, adaptivity: bool = False,
+    def fit(self, x: np.array, y: np.array, lam: float, max_iters: int = 1000, adaptivity: bool = False,
             lam_a: float = 0.1):
         z = self.basis_expansion_(x, self.df, self.degree)
         print('Starting fitting group lasso.')
@@ -205,11 +216,68 @@ class GAM:
             weights = self.compute_weights_(self.beta, self.df)
             z_weighted = np.copy(z)
             for i in range(len(weights)):
-                z_weighted[:, i*self.df:(i+1)*self.df] = z_weighted[:, i*self.df:(i+1)*self.df] / weights[i]
+                z_weighted[:, i * self.df:(i + 1) * self.df] = z_weighted[:, i * self.df:(i + 1) * self.df] / weights[i]
             self.intercept_a, self.beta_a = self.fit_(z_weighted, y, lam_a, max_iters)
             for i in range(len(weights)):
-                self.beta_a[i*self.df:(i+1)*self.df] = self.beta_a[i*self.df:(i+1)*self.df] / weights[i]
+                self.beta_a[i * self.df:(i + 1) * self.df] = self.beta_a[i * self.df:(i + 1) * self.df] / weights[i]
             print('Adaptive group lasso fit finished.')
+
+    def fit_cv(self, x: np.array, y: np.array, max_iters: int = 1000, lams: list = None, adaptivity: bool = False,
+               lam_as: list = None, cvfold: int = 5):
+        if lams is None:
+            lams = [1e-5, 1e-4, 1e-3, 1e-2, 2e-2, 5e-2, 0.1, 0.15, 0.2, 0.5]
+        z = self.basis_expansion_(x, self.df, self.degree)
+        print('Starting fitting group lasso cv, parameters initialized.')
+        cv_scores = []
+        for lam in lams:
+            cv_score = []
+            cv = KFold(n_splits=cvfold)
+            for train, test in cv.split(z):
+                z_train = z[train, :]
+                z_test = z[test, :]
+                y_train = y[train]
+                y_test = y[test]
+                intercept, beta = self.fit_(z_train, y_train, lam, max_iters)
+                y_pred = np.matmul(z_test, beta) + intercept
+                if self.data_class == 'classification':
+                    y_pred = np.where(y_pred > 0.5, 1, 0)
+                cv_score.append(np.mean((y_pred - y_test) ** 2))
+            cv_scores.append(np.mean(cv_score))
+            print('CV with lambda', lam, 'finished, average score', cv_scores[-1])
+        lam = lams[cv_scores.index(min(cv_scores))]
+        self.intercept, self.beta = self.fit_(z, y, lam, max_iters)
+        print('Group lasso cv finished.')
+        if adaptivity:
+            if lam_as is None:
+                lam_as = [1e-5, 1e-4, 1e-3, 1e-2, 2e-2, 5e-2, 0.1, 0.15, 0.2, 0.5]
+            weights = self.compute_weights_(self.beta, self.df)
+            print('Start adaptive group lasso CV, parameters initialized')
+            z_weighted = np.copy(z)
+            for i in range(len(weights)):
+                z_weighted[:, i * self.df:(i + 1) * self.df] = z_weighted[:, i * self.df:(i + 1) * self.df] / weights[i]
+            cv_scores = []
+            for lam in lam_as:
+                cv_score = []
+                cv = KFold(n_splits=cvfold)
+                for train, test in cv.split(z_weighted):
+                    z_train = z_weighted[train, :]
+                    z_test = z_weighted[test, :]
+                    y_train = y[train]
+                    y_test = y[test]
+                    intercept_a, beta_a = self.fit_(z_train, y_train, lam, max_iters)
+                    for i in range(len(weights)):
+                        beta_a[i * self.df:(i + 1) * self.df] = beta_a[i * self.df:(i + 1) * self.df] / weights[i]
+                    y_pred = np.matmul(z_test, beta_a) + intercept_a
+                    if self.data_class == 'classification':
+                        y_pred = np.where(y_pred > 0, 1, 0)
+                    cv_score.append(np.mean((y_pred - y_test) ** 2))
+                cv_scores.append(np.mean(cv_score))
+                print('CV with lambda', lam, 'finished, average score is', cv_scores[-1])
+            lam_a = lams[cv_scores.index(min(cv_scores))]
+            self.intercept_a, self.beta_a = self.fit_(z_weighted, y, lam_a, max_iters)
+            for i in range(len(weights)):
+                self.beta_a[i * self.df:(i + 1) * self.df] = self.beta_a[i * self.df:(i + 1) * self.df] / weights[i]
+            print('Adaptive group lasso cv finished.')
 
     def predict(self, x: np.array, coefs: str = 'gl'):
         if coefs not in ['gl', 'agl']:
