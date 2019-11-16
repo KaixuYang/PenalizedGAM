@@ -20,6 +20,8 @@ class GAM:
         self.beta_a = None
         self.intercept_a = None
         self.R = None  # right matrices of QR decomposition of basis matrix, used to orthogonalization.
+        self.best_lam = None
+        self.best_lam_a = None
 
     @staticmethod
     def basis_expansion_(x: np.array, df: int, degree: int):
@@ -61,24 +63,28 @@ class GAM:
         group_norm = self.compute_group_norm_(x, group_size)
         return np.sum(group_norm)
 
-    @staticmethod
-    def grouplassothres_(x: np.array, group_size: int, lam: float) -> np.array:
+    def grouplassothres_(self, x: np.array, y: np.array, intercept: np.array, beta: np.array, g: int, group_size: int,
+                         lam: float) -> bool:
         """
         computes the group thresholding function
+        :param group_size: number of variables in each group
+        :param g: the group being applied soft thresholding
+        :param beta: the beta vector
+        :param intercept: the intercept
+        :param y: the response
         :param x: the input parameter matrix
         :param lam: tuning parameter
-        :return: group lasso penalized input
+        :return: Zero (True) or not zero (False)
         """
-        num_group = len(x) / group_size
-        if num_group != int(num_group):
-            raise ValueError("Cannot compute group norm, the length of x is not a multiple of group_size")
-        num_group = int(num_group)
-        for i in range(num_group):
-            norm = np.linalg.norm(x[:, (i * group_size):(i + 1) * group_size])
-            if norm != 0:
-                x[:, (i * group_size):(i + 1) * group_size] = np.max(
-                    [0, 1 - lam / norm]) * x[:, (i * group_size):(i + 1) * group_size]
-        return x
+        x_g = x[:, g * group_size:(g + 1) * group_size]
+        x_without_g = np.delete(x, range(g * group_size, (g + 1) * group_size), 1)
+        beta_without_g = np.delete(beta, range(g * group_size, (g + 1) * group_size), 0)
+        eta_without_g = np.matmul(x_without_g, beta_without_g) + intercept
+        left = np.linalg.norm(np.matmul(x_g.T, y - self.sigmoid_(eta_without_g))) / x.shape[0]
+        if left <= lam:
+            return True
+        else:
+            return False
 
     @staticmethod
     def sigmoid_(x: np.array):
@@ -111,24 +117,37 @@ class GAM:
         x = x.reshape(x_shape)
         return x
 
-    def compute_gradient_reg_(self, x: np.array, y: np.array, beta: np.array, intercept: np.array, lam: float):
+    @staticmethod
+    def compute_grad_intercept_reg_(x: np.array, y: np.array, beta: np.array, intercept: np.array):
         n = x.shape[0]
         grad_intercept = np.sum(-2 * (y - np.matmul(x, beta) - intercept)) / n
-        beta_norm = self.compute_group_norm_(beta, self.df)
-        beta_norm = np.where(beta_norm > 0, beta_norm, 0.001)
-        norm_derivative = (beta.reshape(-1, self.df) / beta_norm).reshape(-1, 1)
-        grad_beta = -2 * np.matmul(x.T, y - np.matmul(x, beta) - intercept) / n + lam * norm_derivative
-        return grad_intercept, grad_beta
+        return grad_intercept
 
-    def compute_gradient_cla_(self, x: np.array, y: np.array, beta: np.array, intercept: np.array, lam: float):
+    @staticmethod
+    def compute_grad_intercept_cla_(self, x: np.array, y: np.array, beta: np.array, intercept: np.array):
         n = x.shape[0]
         eta = np.matmul(x, beta) + intercept
         grad_intercept = np.sum(-(y - self.sigmoid_(eta)) / n)
-        beta_norm = self.compute_group_norm_(beta, self.df)
+        return grad_intercept
+
+    def compute_grad_beta_reg_(self, x: np.array, y: np.array, beta: np.array, intercept: np.array, lam: float, g: int):
+        n = x.shape[0]
+        beta_norm = np.linalg.norm(beta[g * self.df:(g + 1) * self.df])
         beta_norm = np.where(beta_norm > 0, beta_norm, 0.001)
-        norm_derivative = (beta.reshape(-1, self.df) / beta_norm).reshape(-1, 1)
-        grad_beta = -np.matmul(x.T, y - self.sigmoid_(eta)) / n + lam * norm_derivative
-        return grad_intercept, grad_beta
+        norm_derivative = (beta[g * self.df:(g + 1) * self.df].reshape(-1) / beta_norm).reshape(-1, 1)
+        grad_beta = -2 * np.matmul(x[:, g * self.df:(g + 1) * self.df].T, y - np.matmul(x, beta) - intercept) / n \
+            + lam * norm_derivative
+        return grad_beta
+
+    def compute_grad_beta_cla_(self, x: np.array, y: np.array, beta: np.array, intercept: np.array, lam: float, g: int):
+        n = x.shape[0]
+        eta = np.matmul(x, beta) + intercept
+        beta_norm = np.linalg.norm(beta[g * self.df:(g + 1) * self.df])
+        beta_norm = np.where(beta_norm > 0, beta_norm, 0.001)
+        norm_derivative = (beta[g * self.df:(g + 1) * self.df].reshape(-1) / beta_norm).reshape(-1, 1)
+        grad_beta = -np.matmul(x[:, g * self.df:(g + 1) * self.df].T,
+                               y - self.sigmoid_(eta)) / n + lam * norm_derivative
+        return grad_beta
 
     def compute_loss_reg_(self, x: np.array, y: np.array, beta: np.array, intercept: np.array, lam: float):
         n = x.shape[0]
@@ -142,7 +161,7 @@ class GAM:
 
     def fit_(self, z: np.array, y: np.array, lam: float = 0, max_iters: int = 1000):
         z = self.group_orthogonalize_(z, self.df)
-        beta = np.zeros([z.shape[1], 1]) + 0.1
+        beta = np.zeros([z.shape[1], 1])
         intercept = np.zeros([1, 1])
         beta_new = np.copy(beta)
         intercept_new = np.copy(intercept)
@@ -152,44 +171,70 @@ class GAM:
         else:
             loss = self.compute_loss_cla_(z, y, beta, intercept, lam)
         print('The initial loss is', loss)
+        loss_new = loss
         error = 10
         iters = 0
         while error > self.tol and iters <= max_iters:
             iters += 1
+            """start minimizing the loss function with respect to the intercept"""
             learning_rate = self.learning_rate
             if self.data_class == 'regression':
-                grad_intercept, grad_beta = self.compute_gradient_reg_(z, y, beta, intercept, lam)
+                grad_intercept = self.compute_grad_intercept_reg_(z, y, beta, intercept)
             else:
-                grad_intercept, grad_beta = self.compute_gradient_cla_(z, y, beta, intercept, lam)
-            linesearch = 0
-            while linesearch == 0:
+                grad_intercept = self.compute_grad_intercept_cla_(self, z, y, beta, intercept)
+            ls_intercept = 0  # Line search indicator for intercept
+            while ls_intercept == 0:
                 intercept_new = intercept - learning_rate * grad_intercept
-                beta_new = beta - learning_rate * grad_beta
                 if self.data_class == 'regression':
                     loss_new = self.compute_loss_reg_(z, y, beta_new, intercept_new, lam)
                 else:
                     loss_new = self.compute_loss_cla_(z, y, beta_new, intercept_new, lam)
-                if loss_new <= loss - learning_rate * 0.5 * (
-                        np.linalg.norm(beta - beta_new) ** 2 + (intercept_new - intercept) ** 2):
-                    linesearch = 1
+                if loss_new <= loss - learning_rate * 0.5 * (intercept_new - intercept) ** 2:
+                    ls_intercept = 1
                 else:
                     learning_rate = learning_rate * self.learning_rate_shrink
-            beta_new = self.grouplassothres_(beta_new, self.df, lam)
-            if self.data_class == 'regression':
-                loss_new = self.compute_loss_reg_(z, y, beta_new, intercept_new, lam)
-            else:
-                loss_new = self.compute_loss_cla_(z, y, beta_new, intercept_new, lam)
+            intercept = intercept_new  # intercept updated
+            loss_intercept = loss_new
+            """Start iterating among the groups"""
+            learning_rate = self.learning_rate
+            num_group = len(beta) // self.df
+            for g in range(num_group):
+                """shrunk beta g to zero if criterion satisfied"""
+                if self.grouplassothres_(z, y, intercept, beta, g, self.df, lam):
+                    beta[g * self.df:(g + 1) * self.df] = 0
+                else:
+                    """If criterion not satisfied, minimizing loss function with respect to beta g"""
+                    error_beta = 10
+                    while error_beta > self.tol:
+                        ls_beta = 0
+                        while ls_beta == 0:
+                            if self.data_class == 'regression':
+                                grad_beta_g = self.compute_grad_beta_reg_(z, y, beta, intercept, lam, g)
+                            else:
+                                grad_beta_g = self.compute_grad_beta_cla_(z, y, beta, intercept, lam, g)
+                            beta_new = np.copy(beta)
+                            beta_new[g * self.df:(g + 1) * self.df] = beta_new[g * self.df:(g + 1) * self.df] - \
+                                learning_rate * grad_beta_g
+                            if self.data_class == 'regression':
+                                loss_new = self.compute_loss_reg_(z, y, beta_new, intercept, lam)
+                            else:
+                                loss_new = self.compute_loss_cla_(z, y, beta_new, intercept, lam)
+                            if loss_new <= loss_intercept - learning_rate * 0.5 * np.linalg.norm(beta_new - beta) ** 2:
+                                ls_beta = 1
+                            else:
+                                learning_rate = learning_rate * self.learning_rate_shrink
+                        beta = beta_new
+                        error_beta = np.abs(loss_intercept - loss_new)
+                        loss_intercept = loss_new
+            error = np.abs(loss_intercept - loss)
+            loss = loss_intercept
             if iters % 10 == 0:
                 print('Iteration', iters, 'The loss is', loss_new)
-            error = np.abs(loss - loss_new)
-            beta = beta_new
-            intercept = intercept_new
-            loss = loss_new
         if iters < max_iters:
             print('Convergence checked with error', error, 'converged in', iters, 'steps.')
         else:
             print('Not converging, consider increasing the max_iters.')
-        print('The loss is', loss)
+        print('The loss is', loss_new)
         beta = self.group_orthogonalize_inverse_(beta, self.df)
         return intercept, beta
 
@@ -225,7 +270,7 @@ class GAM:
     def fit_cv(self, x: np.array, y: np.array, max_iters: int = 1000, lams: list = None, adaptivity: bool = False,
                lam_as: list = None, cvfold: int = 5):
         if lams is None:
-            lams = [1e-5, 1e-4, 1e-3, 1e-2, 2e-2, 5e-2, 0.1, 0.15, 0.2, 0.5]
+            lams = [1e-3, 1e-2, 2e-2, 3e-2, 5e-2, 8e-2, 0.1, 0.15, 0.2]
         z = self.basis_expansion_(x, self.df, self.degree)
         print('Starting fitting group lasso cv, parameters initialized.')
         cv_scores = []
@@ -245,11 +290,12 @@ class GAM:
             cv_scores.append(np.mean(cv_score))
             print('CV with lambda', lam, 'finished, average score', cv_scores[-1])
         lam = lams[cv_scores.index(min(cv_scores))]
+        self.best_lam = lam
         self.intercept, self.beta = self.fit_(z, y, lam, max_iters)
         print('Group lasso cv finished.')
         if adaptivity:
             if lam_as is None:
-                lam_as = [1e-5, 1e-4, 1e-3, 1e-2, 2e-2, 5e-2, 0.1, 0.15, 0.2, 0.5]
+                lam_as = [1e-4, 1e-3, 5e-3, 1e-2, 2e-2, 5e-2, 0.1, 0.15, 0.2]
             weights = self.compute_weights_(self.beta, self.df)
             print('Start adaptive group lasso CV, parameters initialized')
             z_weighted = np.copy(z)
@@ -274,6 +320,7 @@ class GAM:
                 cv_scores.append(np.mean(cv_score))
                 print('CV with lambda', lam, 'finished, average score is', cv_scores[-1])
             lam_a = lams[cv_scores.index(min(cv_scores))]
+            self.best_lam_a = lam_a
             self.intercept_a, self.beta_a = self.fit_(z_weighted, y, lam_a, max_iters)
             for i in range(len(weights)):
                 self.beta_a[i * self.df:(i + 1) * self.df] = self.beta_a[i * self.df:(i + 1) * self.df] / weights[i]
