@@ -4,8 +4,17 @@ from sklearn.model_selection import KFold
 
 
 class GAM:
-    def __init__(self, learning_rate: float = 1, learning_rate_shrink: float = 0.8, tol: float = 1e-2,
+    def __init__(self, learning_rate: float = 1, learning_rate_shrink: float = 0.8, tol: float = 1e-3,
                  data_class: str = 'regression', degree: int = 3, df: int = 5):
+        """
+        initialize the class
+        :param learning_rate: step size of gradient descent
+        :param learning_rate_shrink: shrink ratio of backtracking line search
+        :param tol: tolerance
+        :param data_class: 'regression' or 'classification'
+        :param degree: degree of B-spline, default cubic B-spline
+        :param df: df of knots, evenly distributed
+        """
         self.learning_rate = learning_rate
         self.learning_rate_shrink = learning_rate_shrink
         self.tol = tol
@@ -15,16 +24,23 @@ class GAM:
             raise ValueError("data_class must be regression or classification.")
         self.degree = degree
         self.df = df
-        self.beta = None
-        self.intercept = None
-        self.beta_a = None
-        self.intercept_a = None
+        self.beta = None  # group lasso coefficients
+        self.intercept = None  # group lasso intercept
+        self.beta_a = None  # adaptive group lasso coefficients
+        self.intercept_a = None  # adaptive group lasso intercept
         self.R = None  # right matrices of QR decomposition of basis matrix, used to orthogonalization.
-        self.best_lam = None
-        self.best_lam_a = None
+        self.best_lam = None  # best lambda of group lasso
+        self.best_lam_a = None  # best lambda of adaptive group lasso
 
     @staticmethod
-    def basis_expansion_(x: np.array, df: int, degree: int):
+    def basis_expansion_(x: np.array, df: int, degree: int) -> np.array:
+        """
+        perform a basis expansion of the design matrix, uses B-spline with evenly distributed knots.
+        :param x: the design matrix
+        :param df: df of B-spline, decides the number of knots with degree
+        :param degree: degree of B-spline, 3 indicates cubic B-spline
+        :return: the basis matrix
+        """
         p = x.shape[1]
         if p > 1:
             res = None
@@ -43,7 +59,13 @@ class GAM:
         return res
 
     @staticmethod
-    def compute_group_norm_(x: np.array, group_size: int):
+    def compute_group_norm_(x: np.array, group_size: int) -> np.array:
+        """
+        computes the norm of each subgroup of a vector
+        :param x: the input array
+        :param group_size: the group size
+        :return: an array with length of len(x) / group_size, where each entry is the norm of sub-vector
+        """
         num_group = len(x) / group_size
         if num_group != int(num_group):
             raise ValueError("Cannot compute group norm, the length of x is not a multiple of group_size")
@@ -54,9 +76,11 @@ class GAM:
         return group_norm
 
     @staticmethod
-    def groupsum_(self, x: np.array, group_size: int):
+    def groupsum_(self, x: np.array, group_size: int) -> np.array:
         """
         computes the group sum of a matrix x (sum of l2-norm of each column)
+        :param self: class
+        :param group_size: group size
         :param x: the parameter matrix
         :return: groupsum_, float
         """
@@ -80,17 +104,31 @@ class GAM:
         x_without_g = np.delete(x, range(g * group_size, (g + 1) * group_size), 1)
         beta_without_g = np.delete(beta, range(g * group_size, (g + 1) * group_size), 0)
         eta_without_g = np.matmul(x_without_g, beta_without_g) + intercept
-        left = np.linalg.norm(np.matmul(x_g.T, y - self.sigmoid_(eta_without_g))) / x.shape[0]
+        if self.data_class == 'classification':
+            left = np.linalg.norm(np.matmul(x_g.T, y - self.sigmoid_(eta_without_g))) / x.shape[0]
+        else:
+            left = np.linalg.norm(np.matmul(x_g.T, y - eta_without_g)) / x.shape[0]
         if left <= lam:
             return True
         else:
             return False
 
     @staticmethod
-    def sigmoid_(x: np.array):
+    def sigmoid_(x: np.array) -> np.array:
+        """
+        computes the sigmoid function
+        :param x: input array
+        :return: sigmoid of the input
+        """
         return np.exp(x) / (1 + np.exp(x))
 
-    def group_orthogonalize_(self, x: np.array, group_size: int):
+    def group_orthogonalize_(self, x: np.array, group_size: int) -> np.array:
+        """
+        implements group-wise orthogonalization of the basis matrix
+        :param x: the basis matrix
+        :param group_size: the group size
+        :return: the group-wisely orthogonalized basis matrix
+        """
         n, p = x.shape
         num_group = p / group_size
         if num_group != int(num_group):
@@ -105,7 +143,13 @@ class GAM:
         self.R = r_matrices
         return new_x
 
-    def group_orthogonalize_inverse_(self, x: np.array, group_size: int):
+    def group_orthogonalize_inverse_(self, x: np.array, group_size: int) -> np.array:
+        """
+        inverse transformation of the group-wise orthogonalization on the coefficients
+        :param x: the coefficients
+        :param group_size: the group size
+        :return: the inverse transformed coefficients
+        """
         num_group = len(self.R)
         if num_group != len(x) / group_size:
             raise ValueError('Group orthogonalization inverse failed, check input.')
@@ -118,19 +162,47 @@ class GAM:
         return x
 
     @staticmethod
-    def compute_grad_intercept_reg_(x: np.array, y: np.array, beta: np.array, intercept: np.array):
+    def compute_grad_intercept_reg_(x: np.array, y: np.array, beta: np.array, intercept: np.array) -> np.array:
+        """
+        computes the gradient of the intercept in the regression mode
+        :param x: the basis matrix
+        :param y: the response
+        :param beta: the coefficents
+        :param intercept: the intercept
+        :return: the gradient of the intercept
+        """
         n = x.shape[0]
         grad_intercept = np.sum(-2 * (y - np.matmul(x, beta) - intercept)) / n
         return grad_intercept
 
     @staticmethod
-    def compute_grad_intercept_cla_(self, x: np.array, y: np.array, beta: np.array, intercept: np.array):
+    def compute_grad_intercept_cla_(self, x: np.array, y: np.array, beta: np.array, intercept: np.array) -> np.array:
+        """
+        computes the gradient of the intercept in the classification mode
+        :param self: the class
+        :param x: the basis matrix
+        :param y: the response
+        :param beta: the coefficients
+        :param intercept: the intercept
+        :return: the gradient of the intercept
+        """
         n = x.shape[0]
         eta = np.matmul(x, beta) + intercept
         grad_intercept = np.sum(-(y - self.sigmoid_(eta)) / n)
         return grad_intercept
 
-    def compute_grad_beta_reg_(self, x: np.array, y: np.array, beta: np.array, intercept: np.array, lam: float, g: int):
+    def compute_grad_beta_reg_(self, x: np.array, y: np.array, beta: np.array, intercept: np.array, lam: float,
+                               g: int) -> np.array:
+        """
+        computes the gradient of the gth group coefficients in the regression mode
+        :param x: the basis matrix
+        :param y: the response
+        :param beta: the coefficients
+        :param intercept: the intercept
+        :param lam: the lambda
+        :param g: the group index
+        :return: the gradient of the gth group of coefficients
+        """
         n = x.shape[0]
         beta_norm = np.linalg.norm(beta[g * self.df:(g + 1) * self.df])
         beta_norm = np.where(beta_norm > 0, beta_norm, 0.001)
@@ -139,7 +211,18 @@ class GAM:
             + lam * norm_derivative
         return grad_beta
 
-    def compute_grad_beta_cla_(self, x: np.array, y: np.array, beta: np.array, intercept: np.array, lam: float, g: int):
+    def compute_grad_beta_cla_(self, x: np.array, y: np.array, beta: np.array, intercept: np.array, lam: float,
+                               g: int) -> np.array:
+        """
+        computes the gradient of the gth group coefficients in the classification mode
+        :param x: the basis matrix
+        :param y: the response
+        :param beta: the coefficients
+        :param intercept: the intercept
+        :param lam: the lambda
+        :param g: the group index
+        :return: the gradient of the gth group of coefficients
+        """
         n = x.shape[0]
         eta = np.matmul(x, beta) + intercept
         beta_norm = np.linalg.norm(beta[g * self.df:(g + 1) * self.df])
@@ -149,17 +232,43 @@ class GAM:
                                y - self.sigmoid_(eta)) / n + lam * norm_derivative
         return grad_beta
 
-    def compute_loss_reg_(self, x: np.array, y: np.array, beta: np.array, intercept: np.array, lam: float):
+    def compute_loss_reg_(self, x: np.array, y: np.array, beta: np.array, intercept: np.array, lam: float) -> float:
+        """
+        computes the loss function in the regression mode
+        :param x: the basis matrix
+        :param y: the response
+        :param beta: the coefficients
+        :param intercept: the intercept
+        :param lam: the lambda
+        :return: the loss function value
+        """
         n = x.shape[0]
         eta = np.matmul(x, beta) + intercept
         return np.linalg.norm(y - eta) ** 2 / n + lam * self.groupsum_(self, beta, self.df)
 
-    def compute_loss_cla_(self, x: np.array, y: np.array, beta: np.array, intercept: np.array, lam: float):
+    def compute_loss_cla_(self, x: np.array, y: np.array, beta: np.array, intercept: np.array, lam: float) -> float:
+        """
+        computes the loss function in the classification mode
+        :param x: the basis matrix
+        :param y: the response
+        :param beta: the coefficients
+        :param intercept: the intercept
+        :param lam: the lambda
+        :return: the loss function value
+        """
         n = x.shape[0]
         eta = np.matmul(x, beta) + intercept
         return -np.sum(y * eta - np.log(1 + np.exp(eta))) / n + lam * self.groupsum_(self, beta, self.df)
 
-    def fit_(self, z: np.array, y: np.array, lam: float = 0, max_iters: int = 1000):
+    def fit_(self, z: np.array, y: np.array, lam: float = 0, max_iters: int = 1000) -> [np.array, np.array]:
+        """
+        fits the group lasso GAM with block-coordinate descent algorithm, internal function
+        :param z: the basis matrix
+        :param y: the response
+        :param lam: the tuning parameter
+        :param max_iters: maximum number of iterations
+        :return: the fitted intercept and coefficients
+        """
         z = self.group_orthogonalize_(z, self.df)
         beta = np.zeros([z.shape[1], 1])
         intercept = np.zeros([1, 1])
@@ -196,7 +305,6 @@ class GAM:
             intercept = intercept_new  # intercept updated
             loss_intercept = loss_new
             """Start iterating among the groups"""
-            learning_rate = self.learning_rate
             num_group = len(beta) // self.df
             for g in range(num_group):
                 """shrunk beta g to zero if criterion satisfied"""
@@ -207,6 +315,7 @@ class GAM:
                     error_beta = 10
                     while error_beta > self.tol:
                         ls_beta = 0
+                        learning_rate = self.learning_rate
                         while ls_beta == 0:
                             if self.data_class == 'regression':
                                 grad_beta_g = self.compute_grad_beta_reg_(z, y, beta, intercept, lam, g)
@@ -219,7 +328,8 @@ class GAM:
                                 loss_new = self.compute_loss_reg_(z, y, beta_new, intercept, lam)
                             else:
                                 loss_new = self.compute_loss_cla_(z, y, beta_new, intercept, lam)
-                            if loss_new <= loss_intercept - learning_rate * 0.5 * np.linalg.norm(beta_new - beta) ** 2:
+                            if loss_new <= loss_intercept - learning_rate * 0.5 * np.linalg.norm(beta_new - beta) ** 2 \
+                                    or learning_rate < 0.001:
                                 ls_beta = 1
                             else:
                                 learning_rate = learning_rate * self.learning_rate_shrink
@@ -239,7 +349,13 @@ class GAM:
         return intercept, beta
 
     @staticmethod
-    def compute_weights_(beta: np.array, group_size: int):
+    def compute_weights_(beta: np.array, group_size: int) -> np.array:
+        """
+        computes the adaptive group lasso weights from the fitted coefficients
+        :param beta: the fitted coefficients
+        :param group_size: the group size
+        :return: the weights
+        """
         num_group = len(beta) // group_size
         weights = np.zeros([num_group, 1])
         for i in range(num_group):
@@ -251,7 +367,17 @@ class GAM:
         return weights
 
     def fit(self, x: np.array, y: np.array, lam: float, max_iters: int = 1000, adaptivity: bool = False,
-            lam_a: float = 0.1):
+            lam_a: float = 0.1) -> None:
+        """
+        fits the model with a use specified lambda
+        :param x: the design matrix
+        :param y: the response
+        :param lam: the lambda for group lasso
+        :param max_iters: the maximum number of iterations
+        :param adaptivity: True for fitting adaptive group lasso GAM after fitting group lasso GAM
+        :param lam_a: the lambda for adaptive group lasso
+        :return: None
+        """
         z = self.basis_expansion_(x, self.df, self.degree)
         print('Starting fitting group lasso.')
         self.intercept, self.beta = self.fit_(z, y, lam, max_iters)
@@ -268,7 +394,18 @@ class GAM:
             print('Adaptive group lasso fit finished.')
 
     def fit_cv(self, x: np.array, y: np.array, max_iters: int = 1000, lams: list = None, adaptivity: bool = False,
-               lam_as: list = None, cvfold: int = 5):
+               lam_as: list = None, cvfold: int = 5) -> None:
+        """
+        fits the GAM with cross validation
+        :param x: the design matrix
+        :param y: the response
+        :param max_iters: the maximum number of iterations
+        :param lams: lambda candidates for group lasso
+        :param adaptivity: True for fitting adaptive group lasso
+        :param lam_as: lambda candidates for adaptive group lasso
+        :param cvfold: number of cross validation folds
+        :return: None
+        """
         if lams is None:
             lams = [1e-3, 1e-2, 2e-2, 3e-2, 5e-2, 8e-2, 0.1, 0.15, 0.2]
         z = self.basis_expansion_(x, self.df, self.degree)
@@ -326,7 +463,13 @@ class GAM:
                 self.beta_a[i * self.df:(i + 1) * self.df] = self.beta_a[i * self.df:(i + 1) * self.df] / weights[i]
             print('Adaptive group lasso cv finished.')
 
-    def predict(self, x: np.array, coefs: str = 'gl'):
+    def predict(self, x: np.array, coefs: str = 'gl') -> np.array:
+        """
+        makes prediction for a design matrix x
+        :param x: the design matrix
+        :param coefs: 'gl' for using group lasso or 'agl' for using adaptive group lasso
+        :return: the prediction
+        """
         if coefs not in ['gl', 'agl']:
             raise ValueError('Coefs is either gl for group lasso or agl for adaptive group lasso')
         if coefs == 'gl':
