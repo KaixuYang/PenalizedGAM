@@ -2,6 +2,9 @@ import numpy as np
 from patsy import dmatrix
 from sklearn.model_selection import KFold
 
+"""
+This package has deprecated. Look at the new version GAM_torch.py
+"""
 
 class GAM:
     def __init__(self, learning_rate: float = 1, learning_rate_shrink: float = 0.8, tol: float = 1e-3,
@@ -31,6 +34,7 @@ class GAM:
         self.R = None  # right matrices of QR decomposition of basis matrix, used to orthogonalization.
         self.best_lam = None  # best lambda of group lasso
         self.best_lam_a = None  # best lambda of adaptive group lasso
+        self.eta_without_g_cache = [-1, -1]  # cache for eta_without_g
 
     @staticmethod
     def basis_expansion_(x: np.array, df: int, degree: int) -> np.array:
@@ -100,14 +104,20 @@ class GAM:
         :param lam: tuning parameter
         :return: Zero (True) or not zero (False)
         """
-        x_g = x[:, g * group_size:(g + 1) * group_size]
-        x_without_g = np.delete(x, range(g * group_size, (g + 1) * group_size), 1)
-        beta_without_g = np.delete(beta, range(g * group_size, (g + 1) * group_size), 0)
-        eta_without_g = np.matmul(x_without_g, beta_without_g) + intercept
-        if self.data_class == 'classification':
-            left = np.linalg.norm(np.matmul(x_g.T, y - self.sigmoid_(eta_without_g))) / x.shape[0]
+        if self.eta_without_g_cache[0] != g:
+            self.eta_without_g_cache[0] = g
+            x_without_g = np.delete(x, range(g * group_size, (g + 1) * group_size), 1)
+            beta_without_g = np.delete(beta, range(g * group_size, (g + 1) * group_size), 0)
+            eta_without_g = np.matmul(x_without_g, beta_without_g) + intercept
+            self.eta_without_g_cache[1] = eta_without_g
         else:
-            left = np.linalg.norm(np.matmul(x_g.T, y - eta_without_g)) / x.shape[0]
+            eta_without_g = self.eta_without_g_cache[1]
+        if self.data_class == 'classification':
+            left = np.linalg.norm(np.matmul(
+                x[:, g * group_size:(g + 1) * group_size].T, y - self.sigmoid_(eta_without_g))) / x.shape[0]
+        else:
+            left = np.linalg.norm(np.matmul(
+                x[:, g * group_size:(g + 1) * group_size].T, y - eta_without_g)) / x.shape[0]
         if left <= lam:
             return True
         else:
@@ -298,7 +308,7 @@ class GAM:
                     loss_new = self.compute_loss_reg_(z, y, beta_new, intercept_new, lam)
                 else:
                     loss_new = self.compute_loss_cla_(z, y, beta_new, intercept_new, lam)
-                if loss_new <= loss - learning_rate * 0.5 * (intercept_new - intercept) ** 2:
+                if loss_new <= loss - learning_rate * 0.5 * (intercept_new - intercept) ** 2 or learning_rate < 0.001:
                     ls_intercept = 1
                 else:
                     learning_rate = learning_rate * self.learning_rate_shrink
@@ -309,18 +319,18 @@ class GAM:
             for g in range(num_group):
                 """shrunk beta g to zero if criterion satisfied"""
                 if self.grouplassothres_(z, y, intercept, beta, g, self.df, lam):
-                    beta[g * self.df:(g + 1) * self.df] = 0
+                    beta[g * self.df:(g + 1) * self.df] = np.zeros([self.df, 1])
                 else:
                     """If criterion not satisfied, minimizing loss function with respect to beta g"""
                     error_beta = 10
                     while error_beta > self.tol:
                         ls_beta = 0
                         learning_rate = self.learning_rate
+                        if self.data_class == 'regression':
+                            grad_beta_g = self.compute_grad_beta_reg_(z, y, beta, intercept, lam, g)
+                        else:
+                            grad_beta_g = self.compute_grad_beta_cla_(z, y, beta, intercept, lam, g)
                         while ls_beta == 0:
-                            if self.data_class == 'regression':
-                                grad_beta_g = self.compute_grad_beta_reg_(z, y, beta, intercept, lam, g)
-                            else:
-                                grad_beta_g = self.compute_grad_beta_cla_(z, y, beta, intercept, lam, g)
                             beta_new = np.copy(beta)
                             beta_new[g * self.df:(g + 1) * self.df] = beta_new[g * self.df:(g + 1) * self.df] - \
                                 learning_rate * grad_beta_g
@@ -366,6 +376,30 @@ class GAM:
                 weights[i] = 1 / norm
         return weights
 
+    @staticmethod
+    def agl_submatrix(
+            x: np.array, beta: np.array, weights: np.array, group_size: int) -> (list, np.array, np.array):
+        """
+        extracts the nonzero submatrix for adaptive group lasso
+        :param x: the basis matrix
+        :param beta: the group lasso estimated coefficients
+        :param weights: the weights
+        :param group_size: the group size
+        :return: the nonzero index, nonzero weights and nonzero submatrix x
+        """
+        nonzero = []
+        weights_nonzero = []
+        x_nonzero = None
+        for i in range(len(weights)):
+            if np.linalg.norm(beta[i*group_size:(i+1)*group_size]) > 0:
+                nonzero.append(i)
+                weights_nonzero.append(weights[i])
+                if x_nonzero is None:
+                    x_nonzero = x[:, i*group_size:(i+1)*group_size]
+                else:
+                    x_nonzero = np.concatenate([x_nonzero, x[:, i*group_size:(i+1)*group_size]], axis=1)
+        return nonzero, np.array(weights_nonzero), x_nonzero
+
     def fit(self, x: np.array, y: np.array, lam: float, max_iters: int = 1000, adaptivity: bool = False,
             lam_a: float = 0.1) -> None:
         """
@@ -385,12 +419,18 @@ class GAM:
         if adaptivity:
             print('Adaptivity is True, start fitting adaptive group lasso')
             weights = self.compute_weights_(self.beta, self.df)
+            nonzero, weights, z = self.agl_submatrix(z, self.beta, weights, self.df)
             z_weighted = np.copy(z)
             for i in range(len(weights)):
                 z_weighted[:, i * self.df:(i + 1) * self.df] = z_weighted[:, i * self.df:(i + 1) * self.df] / weights[i]
-            self.intercept_a, self.beta_a = self.fit_(z_weighted, y, lam_a, max_iters)
+            self.intercept_a, beta_a = self.fit_(z_weighted, y, lam_a, max_iters)
             for i in range(len(weights)):
-                self.beta_a[i * self.df:(i + 1) * self.df] = self.beta_a[i * self.df:(i + 1) * self.df] / weights[i]
+                beta_a[i * self.df:(i + 1) * self.df] = beta_a[i * self.df:(i + 1) * self.df] / weights[i]
+            self.beta_a = np.zeros(self.beta.shape)
+            for i in range(len(self.beta) // self.df):
+                if i in nonzero:
+                    i_index = nonzero.index(i)
+                    self.beta_a[i*self.df:(i+1)*self.df] = beta_a[i_index*self.df:(i_index+1)*self.df]
             print('Adaptive group lasso fit finished.')
 
     def fit_cv(self, x: np.array, y: np.array, max_iters: int = 1000, lams: list = None, adaptivity: bool = False,
@@ -434,6 +474,7 @@ class GAM:
             if lam_as is None:
                 lam_as = [1e-4, 1e-3, 5e-3, 1e-2, 2e-2, 5e-2, 0.1, 0.15, 0.2]
             weights = self.compute_weights_(self.beta, self.df)
+            nonzero, weights, z = self.agl_submatrix(z, self.beta, weights, self.df)
             print('Start adaptive group lasso CV, parameters initialized')
             z_weighted = np.copy(z)
             for i in range(len(weights)):
@@ -458,9 +499,14 @@ class GAM:
                 print('CV with lambda', lam, 'finished, average score is', cv_scores[-1])
             lam_a = lams[cv_scores.index(min(cv_scores))]
             self.best_lam_a = lam_a
-            self.intercept_a, self.beta_a = self.fit_(z_weighted, y, lam_a, max_iters)
+            self.intercept_a, beta_a = self.fit_(z_weighted, y, lam_a, max_iters)
             for i in range(len(weights)):
-                self.beta_a[i * self.df:(i + 1) * self.df] = self.beta_a[i * self.df:(i + 1) * self.df] / weights[i]
+                beta_a[i * self.df:(i + 1) * self.df] = beta_a[i * self.df:(i + 1) * self.df] / weights[i]
+            self.beta_a = np.zeros(self.beta.shape)
+            for i in range(len(self.beta) // self.df):
+                if i in nonzero:
+                    i_index = nonzero.index(i)
+                    self.beta_a[i*self.df:(i+1)*self.df] = beta_a[i_index*self.df:(i_index+1)*self.df]
             print('Adaptive group lasso cv finished.')
 
     def predict(self, x: np.array, coefs: str = 'gl') -> np.array:
