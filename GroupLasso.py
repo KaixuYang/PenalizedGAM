@@ -3,7 +3,8 @@ import torch
 from warnings import warn
 from typing import List, Union
 from utils import check_xy, sigmoid, numpy_to_torch, add_intercept
-
+import os
+os.environ['FOR_DISABLE_CONSOLE_CTRL_HANDLER'] = '1'
 
 class groupLasso:
     """
@@ -287,10 +288,14 @@ class groupLasso:
             x, group_size = add_intercept(x, group_size)
         x1, self.R = self.group_orthogonalization(x, group_size)
         beta, error, iters, loss = self.initialize(group_size)
+        if intercept:
+            intercept_err = np.inf
+        else:
+            intercept_err = 0
         beta_old = beta[:]
         num_groups = len(group_size)
         """start iterations"""
-        while error > self.tol and iters <= max_iters:
+        while error > self.tol and intercept_err > self.tol and iters <= max_iters:
             iters += 1
             for g in range(num_groups):
                 group_idx_start, group_idx_end = self.find_group_index(group_size, g)
@@ -303,8 +308,10 @@ class groupLasso:
                 d = self.compute_d(set_zero, derivative, beta, lam, group_idx_start, group_idx_end, hg)
                 alpha = self.line_search(x1, y, beta, d, group_size, g, lam)
                 beta = beta + alpha * d
-            error = torch.norm(beta - beta_old)
+            if intercept:
+                error = torch.norm(beta[1:] - beta_old[1:])
+                intercept_err = abs(beta[0].detach().numpy() - beta_old[0].detach().numpy())
             beta_old = beta
-            print(f"error is {error}")
+            # print(f"error is {error}")
         beta = self.group_orthogonalization_inverse(beta, self.R, group_size)
         return beta

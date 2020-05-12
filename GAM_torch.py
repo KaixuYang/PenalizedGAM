@@ -6,6 +6,8 @@ from itertools import chain
 import torch
 from typing import Union, List
 from utils import sigmoid, numpy_to_torch, add_intercept, remove_intercept, compute_nonzeros
+import os
+os.environ['FOR_DISABLE_CONSOLE_CTRL_HANDLER'] = '1'
 
 
 class GAM(groupLasso):
@@ -34,6 +36,7 @@ class GAM(groupLasso):
         self.intercept = None  # whether to include intercept
         self.beta_agl = None  # adaptive group lasso coefficients
         self.best_lam_agl = None  # adaptive group lasso best lambda
+        self.normalize_pars = None  # normalizing columns parameters
 
     @staticmethod
     def accuracy(y1: torch.Tensor, y2: torch.Tensor):
@@ -58,6 +61,17 @@ class GAM(groupLasso):
         basis_matrix = basis_expansion.basis(x)
         return torch.from_numpy(basis_matrix)
 
+    def normalize(self, x: torch.Tensor):
+        """normalizes x"""
+        self.normalize_pars = []
+        x_new = x.clone()
+        for i in range(x.shape[1]):
+            minimum, norm = x[:, i].min().item(), torch.norm(x[:, i]).item()
+            self.normalize_pars.append([minimum, norm])
+            x_new[:, i] -= minimum
+            x_new[:, i] /= norm
+        return x_new
+
     def compute_weights(self, beta_hat: torch.Tensor, intercept: bool):
         """computes the adaptive group lasso weights"""
         if intercept:
@@ -65,6 +79,7 @@ class GAM(groupLasso):
         weights = []
         for i in range(len(beta_hat) // self.df):
             weights.append(torch.norm(beta_hat[self.df * i: self.df * (i + 1)]).item())
+        print(weights)
         nonzero_idx = [i for i, j in enumerate(weights) if j != 0]
         nonzero_weights = [1 / weight for weight in weights if weight != 0]
         return nonzero_weights, nonzero_idx
@@ -99,6 +114,7 @@ class GAM(groupLasso):
         """fit the GAM model"""
         self.intercept = intercept
         x = remove_intercept(x)
+        x = self.normalize(x)
         x_basis = self.basis_expansion_(x, self.df, self.degree)
         self.df -= 1
         group_size = [self.df] * x.shape[1]
@@ -109,6 +125,7 @@ class GAM(groupLasso):
                 lam: Union[float, int], max_iters: int = 1000, intercept: bool = True):
         """fits the adaptive group lasso"""
         x = remove_intercept(x)
+        x = self.normalize(x)
         self.df += 1
         x_basis = self.basis_expansion_(x, self.df, self.degree)
         self.df -= 1
@@ -132,6 +149,7 @@ class GAM(groupLasso):
         """fits the group lasso with gic"""
         self.intercept = intercept
         x = remove_intercept(x)
+        x = self.normalize(x)
         self.df += 1
         x_basis = self.basis_expansion_(x, self.df, self.degree)
         self.df -= 1
@@ -142,7 +160,7 @@ class GAM(groupLasso):
         if self.intercept:
            x_basis, group_size = add_intercept(x_basis, group_size)
         if an is None:
-            an = np.log(np.log(x.shape[0])) * np.log(x.shape[1])
+            an = self.df * np.log(np.log(x.shape[0])) * np.log(x.shape[1])
         for lam in lams:
             beta_gl = self.solve(x_basis, y, lam, group_size, max_iters, intercept)
             gic_temp = self.compute_gic(x_basis, y, beta_gl, an, group_size)
@@ -161,6 +179,7 @@ class GAM(groupLasso):
         """fits the adaptive group lasso with gic"""
         self.intercept = intercept
         x = remove_intercept(x)
+        x = self.normalize(x)
         self.df += 1
         x_basis = self.basis_expansion_(x, self.df, self.degree)
         self.df -= 1
@@ -168,7 +187,7 @@ class GAM(groupLasso):
         best_lam = 0
         best_beta = None
         if an is None:
-            an = 2 * np.log(np.log(x.shape[0])) * np.log(x.shape[1])
+            an = self.df * np.log(np.log(x.shape[0])) * np.log(x.shape[1])
         weights, weights_idx = self.compute_weights(self.beta_gic, intercept)
         x_sub = self.agl_transformx(x_basis, weights, weights_idx)
         group_size = [self.df] * len(weights)
@@ -202,6 +221,7 @@ class GAM(groupLasso):
     def predict(self, x: Union[np.ndarray, torch.Tensor]):
         """predicts x"""
         x = numpy_to_torch(x)
+        x = self.normalize(x)
         self.df += 1
         x = self.basis_expansion_(x, self.df, self.degree)
         self.df -= 1
@@ -220,6 +240,7 @@ class GAM(groupLasso):
     def predict_agl(self, x: Union[np.ndarray, torch.Tensor]):
         """predicts x"""
         x = numpy_to_torch(x)
+        x = self.normalize(x)
         self.df += 1
         x = self.basis_expansion_(x, self.df, self.degree)
         self.df -= 1
@@ -238,9 +259,8 @@ class GAM(groupLasso):
     def predict_gic(self, x: Union[np.ndarray, torch.Tensor]):
         """predicts x"""
         x = numpy_to_torch(x)
-        self.df += 1
-        x = self.basis_expansion_(x, self.df, self.degree)
-        self.df -= 1
+        x = self.normalize(x)
+        x = self.basis_expansion_(x, self.df + 1, self.degree)
         if self.intercept:
             x = add_intercept(x)
         eta = torch.matmul(x, self.beta_gic)
@@ -256,6 +276,7 @@ class GAM(groupLasso):
     def predict_agl_gic(self, x: Union[np.ndarray, torch.Tensor]):
         """predicts x"""
         x = numpy_to_torch(x)
+        x = self.normalize(x)
         self.df += 1
         x = self.basis_expansion_(x, self.df, self.degree)
         self.df -= 1

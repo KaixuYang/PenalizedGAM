@@ -2,6 +2,8 @@ import torch
 import numpy as np
 from typing import Union, List
 from warnings import warn
+import os
+os.environ['FOR_DISABLE_CONSOLE_CTRL_HANDLER'] = '1'
 
 
 def check_xy(x: torch.Tensor, y: torch.Tensor):

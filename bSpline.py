@@ -2,6 +2,8 @@ from patsy import dmatrix
 from typing import List, Union
 import numpy as np
 import torch
+import os
+os.environ['FOR_DISABLE_CONSOLE_CTRL_HANDLER'] = '1'
 
 
 class bSpline:
