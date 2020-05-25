@@ -37,6 +37,8 @@ class GAM(groupLasso):
         self.beta_agl = None  # adaptive group lasso coefficients
         self.best_lam_agl = None  # adaptive group lasso best lambda
         self.normalize_pars = None  # normalizing columns parameters
+        self.path = None  # solution path
+        self.basis_expansion = None  # basis expansion info
 
     @staticmethod
     def accuracy(y1: torch.Tensor, y2: torch.Tensor):
@@ -48,17 +50,30 @@ class GAM(groupLasso):
         """computes the mean squared error"""
         return torch.mean((y1 - y2) ** 2)
 
-    @staticmethod
-    def basis_expansion_(x: Union[np.ndarray, torch.Tensor], df: int, degree: int) -> torch.Tensor:
+    def basis_expansion_(self, x: Union[np.ndarray, torch.Tensor], df: int, degree: int) -> torch.Tensor:
         """
         perform a basis expansion of the design matrix, uses B-spline with evenly distributed knots.
         :param x: the design matrix
         :param df: df of B-spline, decides the number of knots with degree
         :param degree: degree of B-spline, 3 indicates cubic B-spline
+        :param x_type: 'train' or 'test
         :return: the basis matrix
         """
         basis_expansion = bSpline(df=df, degree=degree)
         basis_matrix = basis_expansion.basis(x)
+        self.basis_expansion = basis_expansion
+        return torch.from_numpy(basis_matrix)
+
+    def basis_expansion_test_(self, x: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+        """
+        perform a basis expansion of the design matrix, uses B-spline with evenly distributed knots.
+        :param x: the design matrix
+        :param df: df of B-spline, decides the number of knots with degree
+        :param degree: degree of B-spline, 3 indicates cubic B-spline
+        :param x_type: 'train' or 'test
+        :return: the basis matrix
+        """
+        basis_matrix = self.basis_expansion.basis_new(x)
         return torch.from_numpy(basis_matrix)
 
     def normalize(self, x: torch.Tensor):
@@ -70,6 +85,14 @@ class GAM(groupLasso):
             self.normalize_pars.append([minimum, norm])
             x_new[:, i] -= minimum
             x_new[:, i] /= norm
+        return x_new
+
+    def normalize_test(self, x: torch.Tensor):
+        """normalizes test data"""
+        x_new = x.clone()
+        for i in range(x.shape[1]):
+            x_new[:, i] -= self.normalize_pars[i][0]
+            x_new[:, i] /= self.normalize_pars[i][1]
         return x_new
 
     def compute_weights(self, beta_hat: torch.Tensor, intercept: bool):
@@ -110,29 +133,73 @@ class GAM(groupLasso):
         return torch.cat(beta_full)
 
     def fit(self, x: Union[np.ndarray, torch.Tensor], y: Union[np.ndarray, torch.Tensor],
-            lam: Union[float, int], max_iters: int = 1000, intercept: bool = True):
+            lam: Union[float, int], max_iters: int = 1000, intercept: bool = True, smooth: Union[float, int] = 0):
         """fit the GAM model"""
         self.intercept = intercept
         x = remove_intercept(x)
+        x = numpy_to_torch(x)
         x = self.normalize(x)
         x_basis = self.basis_expansion_(x, self.df, self.degree)
-        self.df -= 1
+        print(x_basis)
         group_size = [self.df] * x.shape[1]
-        self.beta = self.solve(x_basis, y, lam, group_size, max_iters, intercept)
+        self.beta = self.solve(x_basis, y, lam, group_size, max_iters, intercept, smooth=smooth)
         return self
 
+    def predict_agl(self, x: Union[np.ndarray, torch.Tensor]):
+        """predicts x"""
+        x = numpy_to_torch(x)
+        x = self.normalize_test(x)
+        # self.df += 1
+        x = self.basis_expansion_test_(x)
+        # self.df -= 1
+        if self.intercept:
+            x = add_intercept(x)
+        eta = torch.matmul(x, self.beta_agl)
+        if self.data_class == 'regression':
+            return eta
+        elif self.data_class == 'classification':
+            return torch.where(sigmoid(eta) > 0.5, torch.ones(len(eta)), torch.zeros(len(eta)))
+        elif self.data_class == 'gamma':
+            return torch.exp(eta)
+        else:
+            return torch.round(torch.exp(eta))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     def fit_agl(self, x: Union[np.ndarray, torch.Tensor], y: Union[np.ndarray, torch.Tensor],
-                lam: Union[float, int], max_iters: int = 1000, intercept: bool = True):
+                lam: Union[float, int], max_iters: int = 1000, intercept: bool = True,
+                smooth: Union[float, int] = None):
         """fits the adaptive group lasso"""
         x = remove_intercept(x)
+        x = numpy_to_torch(x)
         x = self.normalize(x)
-        self.df += 1
+        # self.df += 1
         x_basis = self.basis_expansion_(x, self.df, self.degree)
-        self.df -= 1
+        # self.df -= 1
         weights, weights_idx = self.compute_weights(self.beta, intercept)
         x_sub = self.agl_transformx(x_basis, weights, weights_idx)
         group_size = [self.df] * len(weights)
-        beta_agl = self.solve(x_sub, y, lam, group_size, max_iters, intercept)
+        beta_agl = self.solve(x_sub, y, lam, group_size, max_iters, intercept, smooth=smooth)
         self.beta_agl = self.agl_transformbeta(beta_agl, weights, weights_idx, intercept, x.shape[1])
         return self
 
@@ -143,58 +210,105 @@ class GAM(groupLasso):
         num_nonzero = compute_nonzeros(beta, group_size)
         return -2 * likelihood.detach().item() + an * num_nonzero
 
-    def fit_gic(self, x: Union[np.ndarray, torch.Tensor], y: Union[np.ndarray, torch.Tensor],
+    def fit_path(self, x: Union[np.ndarray, torch.Tensor], y: Union[np.ndarray, torch.Tensor],
                 lams: List[Union[float, int]], max_iters: int = 1000, intercept: bool = True,
-                an: Union[int, float] = None):
-        """fits the group lasso with gic"""
+                smooth: Union[int, float] = 0) -> dict:
+        """fits the group lasso solution path"""
         self.intercept = intercept
+        x = numpy_to_torch(x)
         x = remove_intercept(x)
         x = self.normalize(x)
-        self.df += 1
+        # self.df += 1
         x_basis = self.basis_expansion_(x, self.df, self.degree)
-        self.df -= 1
+        # self.df -= 1
         group_size = [self.df] * x.shape[1]
-        gic = np.inf
-        best_lam = 0
-        best_beta = None
         if self.intercept:
-           x_basis, group_size = add_intercept(x_basis, group_size)
+            x_basis, group_size = add_intercept(x_basis, group_size)
+        betas = self.solution_path(x_basis, y, lams, group_size, max_iters, add_intercept, smooth=smooth)
+        res = {}
+        for i, lam in enumerate(sorted(lams, reverse=True)[1:]):
+            res[lam] = betas[i]
+        self.path = res
+        return res
+
+    def plot_solution_path(self):
+        """plot the solution path"""
+        self.plot_path(self.path)
+
+    def predict_mse(self, x_test: torch.Tensor, y_test: torch.Tensor):
+        """predicts the path"""
+        x = numpy_to_torch(x_test)
+        x = self.normalize_test(x)
+        # self.df += 1
+        x = self.basis_expansion_test_(x)
+        # self.df -= 1
+        if self.intercept:
+            x = add_intercept(x)
+        mses = []
+        for lam, beta in self.path.items():
+            eta = torch.matmul(x, beta)
+            if self.data_class == 'regression':
+                y = eta
+            elif self.data_class == 'classification':
+                y = torch.where(sigmoid(eta) > 0.5, torch.ones(len(eta)), torch.zeros(len(eta)))
+            elif self.data_class == 'gamma':
+                y = torch.exp(eta)
+            else:
+                y = torch.round(torch.exp(eta))
+            mses.append(torch.mean((y - y_test) ** 2).item())
+            print(f"lam is {lam}, mse is {mses[-1]}, number of nonzeros is {compute_nonzeros(beta, [1] + [self.df] * x.shape[1]) - 1}")
+
+    def fit_gic(self, x: Union[np.ndarray, torch.Tensor], y: Union[np.ndarray, torch.Tensor],
+                lams: List[Union[float, int]], max_iters: int = 1000, intercept: bool = True,
+                an: Union[int, float] = None, smooth: Union[int, float] = 0):
+        """fits the group lasso with gic"""
+        result = self.fit_path(x, y, lams, max_iters, intercept, smooth=smooth)
+        self.intercept = intercept
+        x = remove_intercept(x)
+        x = numpy_to_torch(x)
+        x = self.normalize(x)
+        # self.df += 1
+        x_basis = self.basis_expansion_(x, self.df, self.degree)
+        # self.df -= 1
+        group_size = [self.df] * x.shape[1]
+        if self.intercept:
+            x_basis, group_size = add_intercept(x_basis, group_size)
+        best_gic = np.inf
         if an is None:
-            an = self.df * np.log(np.log(x.shape[0])) * np.log(x.shape[1])
-        for lam in lams:
-            beta_gl = self.solve(x_basis, y, lam, group_size, max_iters, intercept)
-            gic_temp = self.compute_gic(x_basis, y, beta_gl, an, group_size)
-            if gic_temp < gic:
-                gic = gic_temp
+            an = np.log(np.log(x.shape[0])) * np.log(x.shape[1]) / x.shape[0]
+        for lam in result.keys():
+            gic = self.compute_gic(x_basis, y, result[lam], an, group_size)
+            if gic < best_gic:
                 best_lam = lam
-                best_beta = beta_gl[:]
+                best_beta = result[lam]
+                best_gic = gic
         self.beta_gic = best_beta
-        self.best_lam = best_lam
         print(f"The best lam {best_lam} and the best gic {gic}.")
         return self
 
     def fit_agl_gic(self, x: Union[np.ndarray, torch.Tensor], y: Union[np.ndarray, torch.Tensor],
                     lams: List[Union[float, int]], max_iters: int = 1000, intercept: bool = True,
-                    an: Union[int, float] = None):
+                    an: Union[int, float] = None, smooth: Union[float, int] = None):
         """fits the adaptive group lasso with gic"""
         self.intercept = intercept
         x = remove_intercept(x)
+        x = numpy_to_torch(x)
         x = self.normalize(x)
-        self.df += 1
+        # self.df += 1
         x_basis = self.basis_expansion_(x, self.df, self.degree)
-        self.df -= 1
+        # self.df -= 1
         gic = np.inf
         best_lam = 0
         best_beta = None
         if an is None:
-            an = self.df * np.log(np.log(x.shape[0])) * np.log(x.shape[1])
+            an = self.df * np.log(np.log(x.shape[0])) * np.log(x.shape[1]) / x.shape[0]
         weights, weights_idx = self.compute_weights(self.beta_gic, intercept)
         x_sub = self.agl_transformx(x_basis, weights, weights_idx)
         group_size = [self.df] * len(weights)
         if self.intercept:
             x_basis, group_size = add_intercept(x_sub, group_size)
         for lam in lams:
-            beta_gl = self.solve(x_basis, y, lam, group_size, max_iters, intercept)
+            beta_gl = self.solve(x_basis, y, lam, group_size, max_iters, intercept, smooth=smooth)
             gic_temp = self.compute_gic(x_basis, y, beta_gl, an, group_size)
             if gic_temp < gic:
                 gic = gic_temp
@@ -208,7 +322,8 @@ class GAM(groupLasso):
 
     def fit_cv(self, x: Union[np.ndarray, torch.Tensor], y: Union[np.ndarray, torch.Tensor], group_size: List[int],
                cv_folds: int = 5,
-               lams: List[Union[float, int]] = None, max_iters: int = 1000, add_intercept: bool = True):
+               lams: List[Union[float, int]] = None, max_iters: int = 1000, add_intercept: bool = True,
+               smooth: Union[float, int] = None):
         """fit the GAM with cross-validation"""
         metrics = {
             'regression': self.mse,
@@ -221,13 +336,14 @@ class GAM(groupLasso):
     def predict(self, x: Union[np.ndarray, torch.Tensor]):
         """predicts x"""
         x = numpy_to_torch(x)
-        x = self.normalize(x)
-        self.df += 1
-        x = self.basis_expansion_(x, self.df, self.degree)
-        self.df -= 1
+        x = self.normalize_test(x)
+        # self.df += 1
+        x_basis = self.basis_expansion_test_(x)
+        # self.df -= 1
         if self.intercept:
-            x = add_intercept(x)
-        eta = torch.matmul(x, self.beta)
+            x_basis = add_intercept(x_basis)
+        # print(self.beta)
+        eta = torch.matmul(x_basis, self.beta)
         if self.data_class == 'regression':
             return eta
         elif self.data_class == 'classification':
@@ -237,30 +353,12 @@ class GAM(groupLasso):
         else:
             return torch.round(torch.exp(eta))
 
-    def predict_agl(self, x: Union[np.ndarray, torch.Tensor]):
-        """predicts x"""
-        x = numpy_to_torch(x)
-        x = self.normalize(x)
-        self.df += 1
-        x = self.basis_expansion_(x, self.df, self.degree)
-        self.df -= 1
-        if self.intercept:
-            x = add_intercept(x)
-        eta = torch.matmul(x, self.beta_agl)
-        if self.data_class == 'regression':
-            return eta
-        elif self.data_class == 'classification':
-            return torch.where(sigmoid(eta) > 0.5, torch.ones(len(eta)), torch.zeros(len(eta)))
-        elif self.data_class == 'gamma':
-            return torch.exp(eta)
-        else:
-            return torch.round(torch.exp(eta))
 
     def predict_gic(self, x: Union[np.ndarray, torch.Tensor]):
         """predicts x"""
         x = numpy_to_torch(x)
-        x = self.normalize(x)
-        x = self.basis_expansion_(x, self.df + 1, self.degree)
+        x = self.normalize_test(x)
+        x = self.basis_expansion_test_(x)
         if self.intercept:
             x = add_intercept(x)
         eta = torch.matmul(x, self.beta_gic)
@@ -276,10 +374,10 @@ class GAM(groupLasso):
     def predict_agl_gic(self, x: Union[np.ndarray, torch.Tensor]):
         """predicts x"""
         x = numpy_to_torch(x)
-        x = self.normalize(x)
-        self.df += 1
-        x = self.basis_expansion_(x, self.df, self.degree)
-        self.df -= 1
+        x = self.normalize_test(x)
+        # self.df += 1
+        x = self.basis_expansion_test_(x)
+        # self.df -= 1
         if self.intercept:
             x = add_intercept(x)
         eta = torch.matmul(x, self.beta_agl_gic)
