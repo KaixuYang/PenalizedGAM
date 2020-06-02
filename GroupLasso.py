@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from warnings import warn
 from typing import List, Union
-from utils import check_xy, sigmoid, numpy_to_torch, add_intercept, compute_nonzeros
+from utils import check_xy, sigmoid, numpy_to_torch, add_intercept, compute_nonzeros, group_norm
 import os
 from datetime import datetime
 import matplotlib.pyplot as plt
@@ -116,7 +116,7 @@ class groupLasso:
     def compute_logistic_hes(x: torch.Tensor, y: torch.Tensor, beta: torch.Tensor):
         """computes the regression hessian matrix diagonal elements"""
         eta = x.matmul(beta)
-        sigma = sigmoid(eta) / (1 + torch.exp(eta))
+        sigma = sigmoid(eta) / (1 + torch.exp(eta)) ** 2
         sigma_sqrt = torch.sqrt(torch.diag(sigma.squeeze()))
         return -torch.norm(sigma_sqrt.matmul(x), dim=0) ** 2 / x.shape[0]
 
@@ -264,7 +264,8 @@ class groupLasso:
         hg = max(hg, c_star)
         return hg
 
-    def check_threshold(self, derivative: torch.Tensor, hg: float, beta: torch.Tensor, lam: Union[float, int],
+    @staticmethod
+    def check_threshold(derivative: torch.Tensor, hg: float, beta: torch.Tensor, lam: Union[float, int],
                         group_idx_start: int, group_idx_end: int):
         """checks if the current group should be dropped"""
         diff = derivative[group_idx_start: group_idx_end] - hg * beta[group_idx_start: group_idx_end]
@@ -274,7 +275,8 @@ class groupLasso:
         else:
             return False
 
-    def compute_d(self, set_zero: bool, derivative: torch.Tensor, beta: torch.Tensor, lam: float,
+    @staticmethod
+    def compute_d(set_zero: bool, derivative: torch.Tensor, beta: torch.Tensor, lam: float,
                   group_idx_start: int, group_idx_end: int, hg: float):
         """compute the gradient"""
         if set_zero:
@@ -284,8 +286,11 @@ class groupLasso:
         else:
             diff = derivative[group_idx_start: group_idx_end] - hg * beta[group_idx_start: group_idx_end]
             group_size = group_idx_end - group_idx_start
-            d = -(derivative[group_idx_start: group_idx_end] - lam * np.sqrt(group_size) * diff / torch.norm(diff, 2)) \
-                / hg
+            if group_size == 1:
+                d = -derivative[group_idx_start: group_idx_end] / hg
+            else:
+                d = -(derivative[group_idx_start: group_idx_end]
+                      - lam * np.sqrt(group_size) * diff / torch.norm(diff, 2)) / hg
             d_full = torch.zeros_like(beta)
             d_full[group_idx_start: group_idx_end] = d
             return -d_full
@@ -294,23 +299,24 @@ class groupLasso:
                                lam: Union[float, int]):
         """computes the penalized loss function"""
         penalty = torch.tensor(0.)
-        for g in range(len(group_size)):
+        for g in range(1, len(group_size)):
             start, end = self.find_group_index(group_size, g)
             penalty += lam * np.sqrt(group_size[g]) * torch.norm(beta[start: end], 2)
         return -like + penalty
 
     def close_form_QM(self, beta: torch.Tensor, derivative: torch.Tensor, hg: float, lam: Union[int, float],
-                      group_idx_start: int, group_idx_end: int, smooth: Union[int, float] = 0):
+                      group_idx_start: int, group_idx_end: int, weight: Union[int, float],
+                      smooth: Union[int, float] = 0):
         """find the closed form solution for a group using the QM method"""
         u_beta = derivative[group_idx_start: group_idx_end] + hg * beta[group_idx_start: group_idx_end]
-        thres_func = (1 - lam / torch.norm(u_beta)).item()
+        thres_func = (1 - lam * weight / torch.norm(u_beta)).item()
         if thres_func < 0:
             return torch.zeros(group_idx_end - group_idx_start)
         else:
             if smooth > 0:
                 s = self.generate_smooth_matrix(group_idx_end - group_idx_start)
                 u_norm = torch.norm(u_beta)
-                multiplier = (u_norm / (u_norm - lam)) * torch.eye(group_idx_end - group_idx_start) \
+                multiplier = (u_norm / (u_norm - lam * weight)) * torch.eye(group_idx_end - group_idx_start) \
                              + smooth * s
                 return multiplier.inverse().matmul(u_beta) / hg
             else:
@@ -335,9 +341,9 @@ class groupLasso:
         gradient = self.compute_grad(x, y, beta)
         if self.smoothness_penalty is not None:
             gradient -= self.compute_smoothness_grad(beta, group_size)
-        expected_decrease = -torch.matmul(d.t(), gradient) + \
-                            lam * np.sqrt(group_size[g]) * torch.norm(beta[start: end] + d[start: end], 2) - \
-                            lam * np.sqrt(group_size[g]) * torch.norm(beta[start: end], 2)
+        expected_decrease = -torch.matmul(d.t(), gradient)
+            # lam * np.sqrt(group_size[g]) * torch.norm(beta[start: end] + d[start: end], 2) - \
+            # lam * np.sqrt(group_size[g]) * torch.norm(beta[start: end], 2)
         while decrease > alpha * sigma * expected_decrease:
             alpha *= delta
             new_beta = beta + alpha * d
@@ -348,19 +354,41 @@ class groupLasso:
             decrease = loss_new - loss_old
         return alpha
 
+    def null_estimate(self, y: torch.Tensor):
+        """return the null model intercept"""
+        mean = y.mean().item()
+        if self.data_class == 'regression':
+            return mean
+        elif self.data_class == 'classification':
+            return np.log(mean / (1 - mean))
+        elif self.data_class == 'gamma':
+            return -np.log(mean)
+        else:
+            return np.log(mean)
+
+    def find_max_lambda(self, x: torch.Tensor, y: torch.Tensor, weights: List[float], group_size: List[int]):
+        """find the smallest lambda that corresponds to no active variables"""
+        beta = torch.tensor([self.null_estimate(y)] + [0] * sum(group_size))
+        grad = self.compute_grad(x, y, beta)
+        group_norms = group_norm(grad[1:], group_size)
+        weights = [i if i != 0 else np.inf for i in weights]
+        group_norms /= torch.tensor(weights)
+        return max(group_norms)
+
     def solve(self, x: Union[np.ndarray, torch.Tensor], y: Union[np.ndarray, torch.Tensor], lam: Union[float, int],
-              group_size: Union[int, List[int]], max_iters: int = 1000, intercept: bool = True,
-              smooth: Union[float, int] = 0, recompute_hg: bool = True, beta_warm: torch.Tensor = None) \
-            -> torch.Tensor:
+              group_size: Union[int, List[int]], max_iters: int = 1000, weight: List[Union[int, List[int]]] = None,
+              smooth: Union[float, int] = 0, recompute_hg: bool = True,
+              beta_warm: torch.Tensor = None, weight_multiplied: bool = False) -> torch.Tensor:
         """
         fits the model with a use specified lambda
         :param x: the design matrix
         :param y: the response
         :param lam: the lambda for group lasso
         :param group_size: list of group sizes, or simple group size if all groups are of the same size
+        :param weight: feature weights
         :param max_iters: the maximum number of iterations
-        :param intercept: whether to add intercept
         :param smooth: smoothness parameter
+        :param recompute_hg: whether to recompute hg
         :param beta_warm: warm start of beta
         :return: coefficients
         """
@@ -374,17 +402,19 @@ class groupLasso:
         x = numpy_to_torch(x)
         y = numpy_to_torch(y)
         x, y = check_xy(x, y)
-        if intercept:
-            x, group_size = add_intercept(x, group_size)
+        x, group_size = add_intercept(x, group_size)
+        if weight is None:
+            weight = [1] * len(group_size)
+        if not weight_multiplied:
+            weights = [np.sqrt(group_size[i]) * weight[i] for i in range(len(group_size))]
+        else:
+            weights = weight[:]
         x1 = x.clone()
         # x1, self.R = self.group_orthogonalization(x, group_size)
         beta, error, iters, loss = self.initialize(group_size)
         if beta_warm is not None and beta_warm.shape == beta.shape:
             beta = beta_warm
-        if intercept:
-            intercept_err = np.inf
-        else:
-            intercept_err = 0
+        intercept_err = np.inf
         beta_old = beta.clone()
         num_groups = len(group_size)
         hg = None
@@ -398,25 +428,24 @@ class groupLasso:
                 derivative = self.compute_grad(x1, y, beta)
                 # if self.smoothness_penalty > 0:
                 #     derivative -= self.compute_smoothness_grad(beta, group_size)
-                if intercept and g == 0:
+                if g == 0:
                     d = self.compute_d(False, derivative, beta, lam, group_idx_start, group_idx_end, hg)
                     alpha = self.line_search(x1, y, beta, d, group_size, g, lam)
                     beta = beta + alpha * d
                 else:
                     beta[group_idx_start: group_idx_end] = self.close_form_QM(beta, derivative, hg, lam,
-                                                                              group_idx_start, group_idx_end, smooth)
-            if intercept:
-                error = torch.norm(beta[1:] - beta_old[1:])
-                intercept_err = abs(beta[0].detach().numpy() - beta_old[0].detach().numpy())
-            else:
-                error = torch.norm(beta - beta_old)
+                                                                              group_idx_start, group_idx_end,
+                                                                              weights[g], smooth)
+            error = torch.norm(beta[1:] - beta_old[1:])
+            intercept_err = abs(beta[0].detach().numpy() - beta_old[0].detach().numpy())
             beta_old = beta.clone()
-            print(f"error is {error}")
+            # print(f"error is {error}")
         # beta = self.group_orthogonalization_inverse(beta, self.R, group_size)
         return beta
 
     def strong_rule(self, x: torch.Tensor, y: torch.Tensor, beta: torch.Tensor, group_size: List[int],
-                    lam: Union[int, float], lam_last: Union[int, float]) -> List[int]:
+                    lam: Union[int, float], lam_last: Union[int, float], weight: List[Union[int, List[int]]]) \
+            -> List[int]:
         """filter the groups that satisfy the strong rule"""
         x = numpy_to_torch(x)
         y = numpy_to_torch(y)
@@ -426,25 +455,32 @@ class groupLasso:
             group_idx_start, group_idx_end = self.find_group_index(group_size, g)
             if group_idx_end - group_idx_start == 1:
                 strong_index.append(g)
+            elif weight[g] == np.inf:
+                continue
             else:
                 left = torch.norm(-derivative[group_idx_start: group_idx_end])
-                right = np.sqrt(group_size[g]) * (2 * lam - lam_last)
+                if 2 * lam - lam_last == 0:
+                    right = np.inf
+                else:
+                    right = weight[g] * (2 * lam - lam_last)
                 if left >= right:
                     strong_index.append(g)
         return strong_index
 
     @staticmethod
-    def strong_x(x: torch.Tensor, group_size: List[int], strong_index: List[int]):
-        """find the sub-matrix of x that satisfies the strong rule and their group sizes"""
+    def strong_x(x: torch.Tensor, group_size: List[int], strong_index: List[int], weight: List[Union[int, List[int]]]):
+        """find the sub-matrix of x that satisfies the strong rule, their group sizes and weights"""
         group_idx = []
         group_size_new = []
+        weight_new = []
         start = 0
         for i in range(len(group_size)):
             if i in strong_index:
                 group_idx += list(range(start, start + group_size[i]))
                 group_size_new.append(group_size[i])
+                weight_new.append(weight[i])
             start += group_size[i]
-        return x[:, group_idx], group_size_new
+        return x[:, group_idx], group_size_new, weight_new
 
     @staticmethod
     def strong_to_full_beta(beta_s: torch.Tensor, group_size: List[int], group_index: List[int]):
@@ -460,65 +496,80 @@ class groupLasso:
         return beta_new
 
     def fail_kkt(self, x: torch.Tensor, y: torch.Tensor, beta: torch.Tensor, group_size: List[int],
-                 lam: Union[int, float], group_index: List[int]) -> List[int]:
+                 lam: Union[int, float], group_index: List[int], weight: List[Union[int, List[int]]]) -> List[int]:
         """finds the index not in S that fails the KKT condition"""
         v = []
         for g in range(len(group_size)):
-            if g in group_index:
+            if g in group_index or weight[g] == np.inf:
                 continue
             start, end = self.find_group_index(group_size, g)
             derivative = self.compute_grad(x, y, beta)
             left = torch.norm(derivative[start: end])
-            right = lam * np.sqrt(group_size[g])
+            right = lam * weight[g]
             if left > right:
                 v.append(g)
         return v
 
     def solution_path(self, x: Union[np.ndarray, torch.Tensor], y: Union[np.ndarray, torch.Tensor],
-                      lams: List[Union[float, int]], group_size: Union[int, List[int]], max_iters: int = 1000,
-                      intercept: bool = True, smooth: Union[float, int] = 0, recompute_hg: bool = True) \
-            -> List[torch.Tensor]:
+                      num_lams: int, group_size: Union[int, List[int]], max_iters: int = 1000,
+                      smooth: Union[float, int] = 0, recompute_hg: bool = True,
+                      weight: List[Union[int, List[int]]] = None) \
+            -> (List[torch.Tensor], List[float]):
         """
         fits the model with a use specified lambda
         :param x: the design matrix
         :param y: the response
-        :param lams: the lambda for group lasso
+        :param num_lams: number of lambdas
         :param group_size: list of group sizes, or simple group size if all groups are of the same size
         :param max_iters: the maximum number of iterations
-        :param intercept: whether to add intercept
         :param smooth: smoothness parameter
+        :param recompute_hg: whether to recompute hg
+        :param weight: feature weights
         :return: coefficients
         """
-        lams.sort(reverse=True)
         self.group_size = group_size
         if isinstance(group_size, int):
-            group_size = [group_size] * (x.shape[1] // group_size)
+            group_size = [1] + [group_size] * (x.shape[1] // group_size)
+        if weight is None:
+            weight = [0] + [1] * len(group_size)
+        weights = [np.sqrt(group_size[i]) * weight[i] for i in range(len(group_size))]
         assert np.sum(group_size) == x.shape[1], "Sum of group sizes do not match number of variables."
-        assert lams[-1] >= 0, "Tuning parameter lam must be non-negative."
         betas = []
+        lam_max = self.find_max_lambda(x, y, weights[1:], group_size[1:])
+        lam_max *= (1 + 1 / num_lams * 10)
+        lams = list(np.linspace(0, lam_max, num_lams))
+        lams.remove(0)
+        lams.sort(reverse=True)
         lam_last = None
         for lam in lams:
-            if betas == []:
-                beta_full = self.solve(x, y, lam, group_size, max_iters, intercept, smooth, recompute_hg)
+            if not betas:
+                # beta_full = self.solve(x, y, lam, group_size, max_iters, weights, smooth, recompute_hg)
+                beta_full = torch.tensor([self.null_estimate(y)] + [0] * (sum(group_size) - 1))
                 betas.append(beta_full)
                 lam_last = lam
             else:
                 beta = betas[-1]
-                strong_index = self.strong_rule(x, y, beta, group_size, lam, lam_last)
-                x_s, group_size_s = self.strong_x(x, group_size, strong_index)
-                beta_s = self.solve(x_s, y, lam, group_size_s, max_iters, intercept, smooth, recompute_hg)
+                strong_index = self.strong_rule(x, y, beta, group_size, lam, lam_last, weights)
+                x_s, group_size_s, weight_s = self.strong_x(x, group_size, strong_index, weights)
+                beta_s = self.solve(x_s, y, lam, group_size_s, max_iters, weight_s, smooth, recompute_hg,
+                                    weight_multiplied=True)
                 beta_full = self.strong_to_full_beta(beta_s, group_size, strong_index)
-                v = self.fail_kkt(x, y, beta_full, group_size, lam, strong_index)
+                v = self.fail_kkt(x, y, beta_full, group_size, lam, strong_index, weights)
                 while len(v) > 0:
                     strong_index = list(set(strong_index + v))
-                    x_s, group_size_s = self.strong_x(x, group_size, strong_index)
-                    beta_s = self.solve(x_s, y, lam, group_size_s, max_iters, intercept, smooth, recompute_hg)
+                    x_s, group_size_s, weight_s = self.strong_x(x, group_size, strong_index, weights)
+                    beta_s = self.solve(x_s, y, lam, group_size_s, max_iters, weight_s, smooth,
+                                        recompute_hg, weight_multiplied=True)
                     beta_full = self.strong_to_full_beta(beta_s, group_size, strong_index)
-                    v = self.fail_kkt(x, y, beta_full, group_size, lam, strong_index)
+                    v = self.fail_kkt(x, y, beta_full, group_size, lam, strong_index, weights)
                 betas.append(beta_full)
                 lam_last = lam
-            print(f"Fitted lam = {lam}, {compute_nonzeros(beta_full, group_size) - 1} nonzero variables")
-        return betas[1:]
+            num_nz, nz = compute_nonzeros(beta_full, group_size)
+            print(f"Fitted lam = {lam}, {num_nz - 1} nonzero variables {nz}")
+            if sum([group_size[i] for i in nz]) > x.shape[0]:
+                lams = lams[:lams.index(lam) + 1]
+                break
+        return betas, lams,
 
     def compute_group_norm(self, beta: torch.Tensor, group_size: List[int]):
         """compute the group norms of a beta"""
@@ -532,31 +583,29 @@ class groupLasso:
         """plot the solution path"""
         if group_size is None:
             group_size = self.group_size
-        intercept = 0
-        if group_size[0] == 1:
-            group_size = group_size[1:]
-            intercept = 1
         lams = list(result.keys())
+        nz = compute_nonzeros(result[lams[-1]], group_size)[1]
         beta_norms = []
         for lam in lams:
-            beta_norms.append(self.compute_group_norm(result[lam][intercept:], group_size))
-        lams = lams[1:]
-        beta_nonzero = []
-        for i in range(len(beta_norms)):
-            beta_nonzero.append((np.array(beta_norms[i]) != 0).sum())
-        first_nonzero = beta_nonzero.index([i for i in beta_nonzero if i > 0][0])
-        if first_nonzero > 5:
-            first_nonzero -= 5
-        else:
-            first_nonzero = 0
-        lams = lams[first_nonzero:]
-        beta_norms = beta_norms[first_nonzero:]
+            beta_norms.append(self.compute_group_norm(result[lam][1:], group_size))
+        # lams = lams[1:]
+        # beta_nonzero = []
+        # for i in range(len(beta_norms)):
+        #     beta_nonzero.append((np.array(beta_norms[i]) != 0).sum())
+        # first_nonzero = beta_nonzero.index([i for i in beta_nonzero if i > 0][0])
+        # if first_nonzero > 5:
+        #     first_nonzero -= 5
+        # else:
+        #     first_nonzero = 0
+        # lams = lams[first_nonzero:]
+        # beta_norms = beta_norms[first_nonzero:]
         beta_norms = np.array(beta_norms)
+        print(beta_norms.shape)
         plt.figure(figsize=(20, 5))
-        plt.plot(lams, beta_norms)
+        plt.plot(lams, beta_norms[:, nz])
         plt.xlabel('Lambda')
         plt.ylabel('L2 norm of coefficients')
         plt.title('Group lasso path')
         plt.axis('tight')
-        plt.legend(['beta' + str(i + 1) for i in range((beta_norms[-1] != 0).sum())])
+        plt.legend(['beta' + str(i) for i in nz])
         plt.show()

@@ -63,8 +63,23 @@ def compute_nonzeros(beta: torch.Tensor, group_size: List[int]):
     """computes how many nonzero groups"""
     num = 0
     start = 0
+    nonzeros = []
     for i in range(len(group_size)):
         if torch.norm(beta[start: start + group_size[i]]) != 0:
+            nonzeros.append(i)
             num += 1
         start += group_size[i]
-    return num
+    return num, nonzeros
+
+def group_norm(x: torch.Tensor, group_size: List[int]):
+    """computes the grouped l2 norms"""
+    if all([i == group_size[0] for i in group_size]):
+        x_temp = x.reshape(-1, group_size[0])
+        return torch.norm(x_temp, dim=1)
+    else:
+        group_norm = torch.zeros(len(group_size))
+        start = 0
+        for i in range(len(group_size)):
+            group_norm[i] = torch.norm(x[start: start + group_size[i]])
+            start += group_size[i]
+        return group_norm
