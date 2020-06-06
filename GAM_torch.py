@@ -7,6 +7,7 @@ import torch
 from typing import Union, List
 from utils import sigmoid, numpy_to_torch, add_intercept, remove_intercept, compute_nonzeros
 import os
+import matplotlib.pyplot as plt
 os.environ['FOR_DISABLE_CONSOLE_CTRL_HANDLER'] = '1'
 
 
@@ -112,6 +113,7 @@ class GAM(groupLasso):
         """fit the GAM model"""
         x = remove_intercept(x)
         x = numpy_to_torch(x)
+        y = numpy_to_torch(y)
         x = self.normalize(x)
         x_basis = self.basis_expansion_(x, self.df, self.degree)
         group_size = [self.df] * x.shape[1]
@@ -145,6 +147,7 @@ class GAM(groupLasso):
                 an: Union[int, float] = None, smooth: Union[int, float] = 0):
         """fits the group lasso with gic"""
         x = numpy_to_torch(x)
+        y = numpy_to_torch(y)
         x = remove_intercept(x)
         x = self.normalize(x)
         x_basis = self.basis_expansion_(x, self.df, self.degree)
@@ -177,6 +180,7 @@ class GAM(groupLasso):
             weights = self.compute_weights(self.beta)
         x = remove_intercept(x)
         x = numpy_to_torch(x)
+        y = numpy_to_torch(y)
         x = self.normalize(x)
         x_basis = self.basis_expansion_(x, self.df, self.degree)
         group_size = [self.df] * len(weights)
@@ -192,6 +196,7 @@ class GAM(groupLasso):
         """fits the adaptive group lasso with gic"""
         weights = self.compute_weights(self.beta_gic)
         x = numpy_to_torch(x)
+        y = numpy_to_torch(y)
         x = remove_intercept(x)
         x = self.normalize(x)
         x_basis = self.basis_expansion_(x, self.df, self.degree)
@@ -222,6 +227,7 @@ class GAM(groupLasso):
               an: Union[int, float] = None, smooth: Union[float, int] = 0):
         """fit group lasso then followed by adaptive group lasso, saves time for basis expansion"""
         x = numpy_to_torch(x)
+        y = numpy_to_torch(y)
         x = remove_intercept(x)
         x = self.normalize(x)
         x_basis = self.basis_expansion_(x, self.df, self.degree)
@@ -235,7 +241,7 @@ class GAM(groupLasso):
         best_lam = 0
         best_beta = None
         if an is None:
-            an = np.log(np.log(x.shape[0])) * np.log(x.shape[1]) / x.shape[0]
+            an = np.log(x.shape[1]) / x.shape[0]
         for lam in result.keys():
             beta_full = result[lam]
             gic = self.compute_gic(x_basis, y, beta_full, an, group_size)
@@ -255,7 +261,7 @@ class GAM(groupLasso):
         x = numpy_to_torch(x)
         x = remove_intercept(x)
         x = self.normalize_test(x)
-        x_basis = self.basis_expansion_test_(x)
+        x_basis = self.basis_expansion_(x, self.df, self.degree)
         x_basis = add_intercept(x_basis)
         eta = torch.matmul(x_basis, self.beta)
         if self.data_class == 'regression':
@@ -267,41 +273,36 @@ class GAM(groupLasso):
         else:
             return torch.round(torch.exp(eta))
 
-    def predict_mse(self, x_test: torch.Tensor, y_test: torch.Tensor):
-        """predicts the path"""
-        x = numpy_to_torch(x_test)
-        x = self.normalize_test(x)
-        x = self.basis_expansion_test_(x)
-        x = add_intercept(x)
-        mses = []
-        for lam, beta in self.path.items():
-            eta = torch.matmul(x, beta)
-            if self.data_class == 'regression':
-                y = eta
-            elif self.data_class == 'classification':
-                y = torch.where(sigmoid(eta) > 0.5, torch.ones(len(eta)), torch.zeros(len(eta)))
-            elif self.data_class == 'gamma':
-                y = torch.exp(-eta)
-            else:
-                y = torch.round(torch.exp(eta))
-            mses.append(torch.mean((y - y_test) ** 2).item())
-            print(f"lam is {lam}, mse is {mses[-1]}, "
-                  f"number of nonzeros is {compute_nonzeros(beta, [1] + [self.df] * x.shape[1])[0] - 1}")
+    def plot_functions(self, x: Union[np.ndarray, torch.Tensor], cols: int = 5):
+        """plot the estimated functions"""
+        x = numpy_to_torch(x)
+        x = remove_intercept(x)
+        x_n = self.normalize_test(x)
+        x_basis = self.basis_expansion_(x_n, self.df, self.degree)
+        beta = self.beta[1:]
+        nz, nzs = compute_nonzeros(beta, [self.df] * x.shape[1])
+        nrows = nz // cols + 1
+        fig, ax = plt.subplots(nrows=nrows, ncols=cols, figsize=(20, 12))
+        x_o = torch.exp(x) - 0.1
+        for i, j in enumerate(nzs):
+            eta = torch.matmul(
+                x_basis[:, self.df * j: self.df * (j + 1)], beta[self.df * j: self.df * (j + 1)].double())
+            ax.flatten()[i].scatter(x_o.detach().numpy()[:, j], eta.detach().numpy())
+            ax.flatten()[i].title.set_text(f"Variable {j + 1}")
+        plt.show()
 
 
-
-
-    def fit_cv(self, x: Union[np.ndarray, torch.Tensor], y: Union[np.ndarray, torch.Tensor], group_size: List[int],
-               cv_folds: int = 5,
-               lams: List[Union[float, int]] = None, max_iters: int = 1000, add_intercept: bool = True,
-               smooth: Union[float, int] = None):
-        """fit the GAM with cross-validation"""
-        metrics = {
-            'regression': self.mse,
-            'classification': self.accuracy,
-            'gamma': self.mse,
-            'poisson': self.mse
-        }
-        compute_metric = getattr(metrics, self.data_class)
+    # def fit_cv(self, x: Union[np.ndarray, torch.Tensor], y: Union[np.ndarray, torch.Tensor], group_size: List[int],
+    #            cv_folds: int = 5,
+    #            lams: List[Union[float, int]] = None, max_iters: int = 1000, add_intercept: bool = True,
+    #            smooth: Union[float, int] = None):
+    #     """fit the GAM with cross-validation"""
+    #     metrics = {
+    #         'regression': self.mse,
+    #         'classification': self.accuracy,
+    #         'gamma': self.mse,
+    #         'poisson': self.mse
+    #     }
+    #     compute_metric = getattr(metrics, self.data_class)
 
 

@@ -116,9 +116,10 @@ class groupLasso:
     def compute_logistic_hes(x: torch.Tensor, y: torch.Tensor, beta: torch.Tensor):
         """computes the regression hessian matrix diagonal elements"""
         eta = x.matmul(beta)
-        sigma = sigmoid(eta) / (1 + torch.exp(eta)) ** 2
+        sigma = torch.exp(eta) / (1 + torch.exp(eta)) ** 2
         sigma_sqrt = torch.sqrt(torch.diag(sigma.squeeze()))
-        return -torch.norm(sigma_sqrt.matmul(x), dim=0) ** 2 / x.shape[0]
+        res = -torch.norm(sigma_sqrt.matmul(x), dim=0) ** 2 / x.shape[0]
+        return res
 
     @staticmethod
     def compute_poisson_like(x: torch.Tensor, y: torch.Tensor, beta: torch.Tensor):
@@ -251,15 +252,13 @@ class groupLasso:
         return group_idx_start, group_idx_end
 
     def compute_hg(self, x: torch.Tensor, y: torch.Tensor, beta: torch.Tensor, group_idx_start: int,
-                   group_idx_end: int, lam_smo: float = 0):
+                   group_idx_end: int):
         """computes the approximated hessian matrix"""
         c_star = 0.1
+        # start = datetime.now().timestamp()
         hessian_diag = self.compute_hes(x, y, beta)
-        # if lam_smo is not None and lam_smo > 0:
-        #     smo_diag = torch.zeros_like(hessian_diag)
-        #     smo_diag[:] = 2
-        #     smo_diag[0] = 1
-        #     hessian_diag -= lam_smo * smo_diag
+        # end = datetime.now().timestamp()
+        # print(f"hes {end - start}")
         hg = -torch.max(hessian_diag[group_idx_start: group_idx_end]).item()
         hg = max(hg, c_star)
         return hg
@@ -426,8 +425,6 @@ class groupLasso:
                 if recompute_hg or hg is None or g <= 2:
                     hg = self.compute_hg(x1, y, beta, group_idx_start, group_idx_end)
                 derivative = self.compute_grad(x1, y, beta)
-                # if self.smoothness_penalty > 0:
-                #     derivative -= self.compute_smoothness_grad(beta, group_size)
                 if g == 0:
                     d = self.compute_d(False, derivative, beta, lam, group_idx_start, group_idx_end, hg)
                     alpha = self.line_search(x1, y, beta, d, group_size, g, lam)
@@ -440,6 +437,7 @@ class groupLasso:
             intercept_err = abs(beta[0].detach().numpy() - beta_old[0].detach().numpy())
             beta_old = beta.clone()
             # print(f"error is {error}")
+        # print(iters)
         # beta = self.group_orthogonalization_inverse(beta, self.R, group_size)
         return beta
 
@@ -447,24 +445,19 @@ class groupLasso:
                     lam: Union[int, float], lam_last: Union[int, float], weight: List[Union[int, List[int]]]) \
             -> List[int]:
         """filter the groups that satisfy the strong rule"""
-        x = numpy_to_torch(x)
-        y = numpy_to_torch(y)
         derivative = self.compute_grad(x, y, beta)
-        strong_index = []
-        for g in range(len(group_size)):
-            group_idx_start, group_idx_end = self.find_group_index(group_size, g)
-            if group_idx_end - group_idx_start == 1:
-                strong_index.append(g)
-            elif weight[g] == np.inf:
+        norms = group_norm(derivative[1:], group_size[1:])
+        strong_index = [0]
+        times = 0
+        for g in range(1, len(group_size)):
+            if weight[g] == np.inf:
                 continue
+            if 2 * lam - lam_last == 0:
+                right = np.inf
             else:
-                left = torch.norm(-derivative[group_idx_start: group_idx_end])
-                if 2 * lam - lam_last == 0:
-                    right = np.inf
-                else:
-                    right = weight[g] * (2 * lam - lam_last)
-                if left >= right:
-                    strong_index.append(g)
+                right = weight[g] * (2 * lam - lam_last)
+            if norms[g - 1] >= right:
+                strong_index.append(g)
         return strong_index
 
     @staticmethod
@@ -499,14 +492,13 @@ class groupLasso:
                  lam: Union[int, float], group_index: List[int], weight: List[Union[int, List[int]]]) -> List[int]:
         """finds the index not in S that fails the KKT condition"""
         v = []
-        for g in range(len(group_size)):
+        derivative = self.compute_grad(x, y, beta)
+        norms = group_norm(derivative[1:], group_size[1:])
+        for g in range(1, len(group_size)):
             if g in group_index or weight[g] == np.inf:
                 continue
-            start, end = self.find_group_index(group_size, g)
-            derivative = self.compute_grad(x, y, beta)
-            left = torch.norm(derivative[start: end])
             right = lam * weight[g]
-            if left > right:
+            if norms[g - 1] > right:
                 v.append(g)
         return v
 
@@ -527,6 +519,8 @@ class groupLasso:
         :param weight: feature weights
         :return: coefficients
         """
+        x = numpy_to_torch(x)
+        y = numpy_to_torch(y)
         self.group_size = group_size
         if isinstance(group_size, int):
             group_size = [1] + [group_size] * (x.shape[1] // group_size)
@@ -551,8 +545,11 @@ class groupLasso:
                 beta = betas[-1]
                 strong_index = self.strong_rule(x, y, beta, group_size, lam, lam_last, weights)
                 x_s, group_size_s, weight_s = self.strong_x(x, group_size, strong_index, weights)
+                # start = datetime.now().timestamp()
                 beta_s = self.solve(x_s, y, lam, group_size_s, max_iters, weight_s, smooth, recompute_hg,
                                     weight_multiplied=True)
+                # end = datetime.now().timestamp()
+                # print(f"solve {end - start}")
                 beta_full = self.strong_to_full_beta(beta_s, group_size, strong_index)
                 v = self.fail_kkt(x, y, beta_full, group_size, lam, strong_index, weights)
                 while len(v) > 0:
@@ -566,7 +563,7 @@ class groupLasso:
                 lam_last = lam
             num_nz, nz = compute_nonzeros(beta_full, group_size)
             print(f"Fitted lam = {lam}, {num_nz - 1} nonzero variables {nz}")
-            if sum([group_size[i] for i in nz]) > x.shape[0]:
+            if sum([group_size[i] for i in nz]) > 2 * x.shape[0]:
                 lams = lams[:lams.index(lam) + 1]
                 break
         return betas, lams,
